@@ -1,0 +1,38 @@
+05/06/2024
+1.Apply filter on cashwise dashboard for view only conveyance/purchase/food data of specific date range
+2.send expense report to the user in email
+
+06/05/2024
+1.Separate topay dashboard-done
+2.Add document number in topay form -done
+3.For all expense for default starting place should be Okhla Industrial Estate-done
+4.Fix admin (approve/reject)action on toPay form-done
+5.Message template create for topay form-done
+6.Image compress-done
+7.same user with multiple expense form type show in different column , should be show in one column-Pending-done
+8.Add email template
+9.add topay mobile number on message to send expense alert message
+10. add date filter on transaction history page same as dashboard date filter-done
+11.Transaction history report user wise-Testing left
+12.Download Report of admin remarks(discussion left)
+
+
+
+
+******************************************
+AI expense management software
+Rydoo,expensify,https://www.fylehq.com/,quikchex,
+
+piggy bank to save money , future perspective
+
+
+***************************
+05/07/2025 
+1.discussion on siteName(select or input)-> keep it one or both (to filter siteName wise data)
+2.reduce amount when admin rejected
+3. filter data based on status and admin message
+
+
+
+***************************************
+show total number of expenses on that date
