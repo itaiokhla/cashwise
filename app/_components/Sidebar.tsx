@@ -53,7 +53,9 @@ const Sidebar = () => {
   const navigationConfig = useMemo(() => {
     const isAdminOrManager = user.role === "admin" || user.role === "manager";
     const canAccessToPayForm = user.role === "admin" || user.role === "toPay";
-const tallyIntegrationAccess = user._id === "67e524ff66dcb162c7476000" || user._id === "67e525f3b5239a00bf276fd3" || user._id === "697d7dfd5ec96f1edc3ba94a";
+    // Ledger and voucher APIs already authorize both administrative roles.
+    // Keep the navigation consistent so seeded admins/managers can test them.
+    const tallyIntegrationAccess = isAdminOrManager;
     const commonItems = [
       {
         type: "item",

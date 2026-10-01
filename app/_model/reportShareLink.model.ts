@@ -57,7 +57,6 @@ const reportShareLinkSchema = new Schema<IReportShareLink>(
     expiresAt: {
       type: Date,
       required: true,
-      index: true,
     },
     revokedAt: {
       type: Date,

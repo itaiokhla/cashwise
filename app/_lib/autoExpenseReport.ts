@@ -273,10 +273,11 @@ function buildShareEmailHtml(params: {
   period: string;
   summary: ReportSummary;
   shareUrl: string;
+  pdfUrls: string[];
   expiresAt: Date;
   generatedAt: string;
 }) {
-  const { scheduleName, reportType, fromDate, toDate, summary, shareUrl, expiresAt, generatedAt } = params;
+  const { scheduleName, reportType, fromDate, toDate, summary, shareUrl, pdfUrls, expiresAt, generatedAt } = params;
   const expiry = new Date(expiresAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
 
   return `<!DOCTYPE html>
@@ -300,12 +301,26 @@ function buildShareEmailHtml(params: {
     .cta-box{background:linear-gradient(135deg,#4f46e5 0%,#7c3aed 100%);border-radius:14px;padding:22px 24px;text-align:center;margin:20px 0}
     .cta-btn{display:inline-block;background:#fff;color:#4f46e5;padding:13px 32px;border-radius:10px;text-decoration:none;font-weight:800;font-size:15px;letter-spacing:.3px}
     .meta-pills{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
-    .pill{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:100px;padding:5px 14px;font-size:11px;color:#64748b;font-weight:600}
+    .pill{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:100px;padding:8px 16px;margin:3px;font-size:11px;color:#64748b;font-weight:600}
     .pill span{color:#1e293b;font-weight:700}
+    .stat-grid{margin-left:-5px;margin-right:-5px}
+    .stat{margin:5px}
     .note{background:#fefce8;border:1px solid #fef08a;border-radius:12px;padding:14px 18px;font-size:12px;color:#713f12;margin-top:16px}
     .note strong{display:block;margin-bottom:3px;color:#92400e;font-size:13px}
     .ftr{padding:18px 32px;border-top:1px solid #f1f5f9;text-align:center}
     .ftr p{margin:0;font-size:11px;color:#94a3b8}
+    @media only screen and (max-width:600px){
+      .wrap{margin:0 auto;padding:10px}
+      .hdr,.bdy,.ftr{padding:20px 16px}
+      .hdr h1{font-size:19px}
+      .meta-pills{display:block;margin:0 0 16px}
+      .pill{display:block;border-radius:10px;margin:8px 0;padding:10px 12px}
+      .stat-grid{display:block;margin:0 0 18px}
+      .stat{display:block;margin:10px 0;padding:14px}
+      .stat-value{font-size:17px}
+      .cta-box{padding:18px 12px}
+      .cta-btn{display:block;padding:12px 14px}
+    }
   </style>
 </head>
 <body>
@@ -343,7 +358,7 @@ function buildShareEmailHtml(params: {
 
         <div class="cta-box">
           <a class="cta-btn" href="${shareUrl}" target="_blank" rel="noopener noreferrer">
-            👁 View Full Report
+            View Web Report
           </a>
           <div style="font-size:11px;color:rgba(255,255,255,.8);margin-top:10px">
             Interactive report with filters, analysis, and PDF download
@@ -352,6 +367,16 @@ function buildShareEmailHtml(params: {
             ${shareUrl}
           </div>
         </div>
+
+        ${pdfUrls.length > 0 ? `
+        <div style="text-align:center;margin:16px 0 8px">
+          ${pdfUrls.map((url, index) => `
+            <a href="${url}" target="_blank" rel="noopener noreferrer"
+               style="display:inline-block;background:#0f172a;color:#fff;padding:11px 20px;margin:4px;border-radius:9px;text-decoration:none;font-weight:700;font-size:13px">
+              Download PDF${pdfUrls.length > 1 ? ` ${index + 1}` : ""}
+            </a>`).join("")}
+          <div style="font-size:11px;color:#64748b;margin-top:8px">PDF file${pdfUrls.length > 1 ? "s are" : " is"} also attached to this email.</div>
+        </div>` : ""}
 
         <div class="note">
           <strong>⏱ Link Expiry</strong>
@@ -374,10 +399,11 @@ function buildShareEmailText(params: {
   toDate: string;
   summary: ReportSummary;
   shareUrl: string;
+  pdfUrls: string[];
   expiresAt: Date;
   generatedAt: string;
 }) {
-  const { scheduleName, fromDate, toDate, summary, shareUrl, expiresAt, generatedAt } = params;
+  const { scheduleName, fromDate, toDate, summary, shareUrl, pdfUrls, expiresAt, generatedAt } = params;
   const expiry = new Date(expiresAt).toLocaleString("en-IN");
   return [
     `CASHWISE — ${scheduleName.toUpperCase()}`,
@@ -391,8 +417,11 @@ function buildShareEmailText(params: {
     `Debit Total:   ${fmtINR(summary.debitTotal)}`,
     `Grand Total:   ${fmtINR(summary.grandTotal)}`,
     "",
-    "View Report:",
+    "View Web Report:",
     shareUrl,
+    "",
+    ...pdfUrls.flatMap((url, index) => [`Download PDF${pdfUrls.length > 1 ? ` ${index + 1}` : ""}:`, url, ""]),
+    "The PDF file is also attached to this email.",
     "",
     `⏱ Link expires: ${expiry}`,
     "---",
@@ -484,11 +513,12 @@ export async function sendAutomatedExpenseReports(
     const appBaseUrl = config?.appBaseUrl || APP_BASE_URL;
 
     // ── Generate report for each period ──────────────────────────────────────
-    let allRows = [];
+    let allRows: NormalisedRow[] = [];
     let combinedSummary: ReportSummary | null = null;
     let reportFromDate = "";
     let reportToDate = "";
     const pdfUrls: string[] = [];
+    const pdfAttachments: { filename: string; content: Buffer; contentType: string }[] = [];
     let totalRecordCount = 0;
     let totalAmount = 0;
 
@@ -535,6 +565,7 @@ export async function sendAutomatedExpenseReports(
       const fileName = `${period}-${reportType}-${safeDate}.pdf`;
       const pdfUrl = await uploadToImageKit(pdfBuffer, "expense-reports", fileName);
       pdfUrls.push(pdfUrl);
+      pdfAttachments.push({ filename: fileName, content: pdfBuffer, contentType: "application/pdf" });
     }
 
     // Use the combined summary of the primary period
@@ -570,7 +601,10 @@ export async function sendAutomatedExpenseReports(
     });
 
     // Snapshot: only keep fields needed for display; skip raw mongoose internals
-    const snapshotRows = allRows.slice(0, 2000).map((row) => ({
+    // Keep the complete result set in the immutable snapshot so the public
+    // report, its filters, analysis tabs, and attachment viewer use the same
+    // data as the generated PDF/email.
+    const snapshotRows = allRows.map((row) => ({
       _id: row._id,
       date: row.date,
       type: row.type,
@@ -659,6 +693,7 @@ export async function sendAutomatedExpenseReports(
       period: config?.period || "all",
       summary: finalSummary,
       shareUrl,
+      pdfUrls,
       expiresAt,
       generatedAt,
     });
@@ -669,6 +704,7 @@ export async function sendAutomatedExpenseReports(
       toDate: reportToDate,
       summary: finalSummary,
       shareUrl,
+      pdfUrls,
       expiresAt,
       generatedAt,
     });
@@ -679,6 +715,7 @@ export async function sendAutomatedExpenseReports(
       subject: `CashWise ${scheduleName} · ${reportFromDate} → ${reportToDate} (${totalRecordCount} records)`,
       text: emailText,
       html: emailHtml,
+      attachments: pdfAttachments,
     });
 
     const durationMs = Date.now() - startTime;

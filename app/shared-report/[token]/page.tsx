@@ -117,10 +117,16 @@ export default function SharedReportPage() {
   // Filters & Tabs
   const [activeTab, setActiveTab] = useState<"table" | "user" | "date" | "category">("table");
   const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [userFilter, setUserFilter] = useState("all");
-  const [categoryFilter, setCategoryFilter] = useState("all");
+  const [statusFilters, setStatusFilters] = useState<string[]>([]);
+  const [userFilters, setUserFilters] = useState<string[]>([]);
+  const [categoryFilters, setCategoryFilters] = useState<string[] | null>(null);
   const [typeFilter, setTypeFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [fromDateFilter, setFromDateFilter] = useState("");
+  const [toDateFilter, setToDateFilter] = useState("");
+  const [visibleFields, setVisibleFields] = useState<string[]>([
+    "date", "user", "type", "source", "category", "site", "amount", "status", "description", "attachments",
+  ]);
   const [currentPage, setCurrentPage] = useState(1);
   const pageSize = 50;
 
@@ -188,13 +194,21 @@ export default function SharedReportPage() {
     return Array.from(set).sort();
   }, [rows]);
 
-  const filteredRows = useMemo(() => {
+  const uniqueSources = useMemo(() => {
+    return Array.from(new Set(rows.map((r) => r.source).filter(Boolean))).sort();
+  }, [rows]);
+
+  // Progressive faceting: global filters → users → categories → dates/table.
+  // Keeping each stage separate lets users select more than one card without
+  // making the remaining user/category cards disappear.
+  const globallyFilteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
-      if (statusFilter !== "all" && r.status !== statusFilter) return false;
-      if (userFilter !== "all" && r.userName !== userFilter) return false;
-      if (categoryFilter !== "all" && r.category !== categoryFilter) return false;
+      if (statusFilters.length > 0 && !statusFilters.includes(r.status?.toLowerCase())) return false;
       if (typeFilter !== "all" && r.type !== typeFilter) return false;
+      if (sourceFilter !== "all" && r.source !== sourceFilter) return false;
+      if (fromDateFilter && r.date < fromDateFilter) return false;
+      if (toDateFilter && r.date > toDateFilter) return false;
 
       if (q) {
         const text = `${r.userName} ${r.siteName} ${r.category} ${r.description} ${r.remarks} ${r.source} ${r.date}`.toLowerCase();
@@ -203,7 +217,17 @@ export default function SharedReportPage() {
 
       return true;
     });
-  }, [rows, search, statusFilter, userFilter, categoryFilter, typeFilter]);
+  }, [rows, search, statusFilters, typeFilter, sourceFilter, fromDateFilter, toDateFilter]);
+
+  const userFilteredRows = useMemo(
+    () => userFilters.length === 0 ? globallyFilteredRows : globallyFilteredRows.filter((row) => userFilters.includes(row.userName)),
+    [globallyFilteredRows, userFilters]
+  );
+
+  const filteredRows = useMemo(
+    () => categoryFilters === null ? userFilteredRows : userFilteredRows.filter((row) => categoryFilters.includes(row.category)),
+    [userFilteredRows, categoryFilters]
+  );
 
   // Summary computed dynamically over filtered rows
   const activeSummary = useMemo(() => {
@@ -234,25 +258,25 @@ export default function SharedReportPage() {
   // Groupings for analysis tabs
   const byUserAnalysis = useMemo(() => {
     const map: Record<string, { total: number; count: number }> = {};
-    filteredRows.forEach((r) => {
+    globallyFilteredRows.forEach((r) => {
       const key = r.userName || "Unknown";
       if (!map[key]) map[key] = { total: 0, count: 0 };
       map[key].total += Number(r.amount || 0);
       map[key].count += 1;
     });
     return Object.entries(map).sort((a, b) => b[1].total - a[1].total);
-  }, [filteredRows]);
+  }, [globallyFilteredRows]);
 
   const byCategoryAnalysis = useMemo(() => {
     const map: Record<string, { total: number; count: number }> = {};
-    filteredRows.forEach((r) => {
+    userFilteredRows.forEach((r) => {
       const key = r.category || "Uncategorized";
       if (!map[key]) map[key] = { total: 0, count: 0 };
       map[key].total += Number(r.amount || 0);
       map[key].count += 1;
     });
     return Object.entries(map).sort((a, b) => b[1].total - a[1].total);
-  }, [filteredRows]);
+  }, [userFilteredRows]);
 
   const byDateAnalysis = useMemo(() => {
     const map: Record<string, { total: number; count: number }> = {};
@@ -264,6 +288,9 @@ export default function SharedReportPage() {
     });
     return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
   }, [filteredRows]);
+
+  const globalFacetTotal = useMemo(() => globallyFilteredRows.reduce((sum, row) => sum + Number(row.amount || 0), 0), [globallyFilteredRows]);
+  const userFacetTotal = useMemo(() => userFilteredRows.reduce((sum, row) => sum + Number(row.amount || 0), 0), [userFilteredRows]);
 
   // Pagination
   const totalPages = Math.ceil(filteredRows.length / pageSize) || 1;
@@ -448,7 +475,6 @@ export default function SharedReportPage() {
   // ─── Dashboard Screen ───────────────────────────────────────────────────────
 
   const theme = TYPE_THEMES[snapshot.reportType] || TYPE_THEMES.expense;
-  const isCombined = snapshot.reportType === "combined";
   const hasCreditsOrDebits = ["credit", "debit", "combined"].includes(snapshot.reportType);
 
   return (
@@ -523,6 +549,13 @@ export default function SharedReportPage() {
                 <div style={{ ...styles.kpiVal, color: "#dc2626" }}>{fmtINR(activeSummary.debitTotal)}</div>
                 <div style={styles.kpiSub}>{filteredRows.filter((r) => r.type === "debit").length} debit records</div>
               </div>
+              <div style={{ ...styles.kpiCard, borderTop: "4px solid #0ea5e9" }}>
+                <div style={styles.kpiLabel}>Net Credit − Debit</div>
+                <div style={{ ...styles.kpiVal, color: activeSummary.netCreditDebit >= 0 ? "#0284c7" : "#dc2626" }}>
+                  {fmtINR(activeSummary.netCreditDebit)}
+                </div>
+                <div style={styles.kpiSub}>credit less debit for the current filters</div>
+              </div>
             </>
           )}
 
@@ -547,28 +580,15 @@ export default function SharedReportPage() {
           />
 
           <select
-            value={statusFilter}
+            value={userFilters.length === 1 ? userFilters[0] : "all"}
             onChange={(e) => {
-              setStatusFilter(e.target.value);
+              setUserFilters(e.target.value === "all" ? [] : [e.target.value]);
+              setCategoryFilters(null);
               setCurrentPage(1);
             }}
             style={styles.filterDropdown}
           >
-            <option value="all">All Statuses</option>
-            <option value="approved">Approved</option>
-            <option value="pending">Pending</option>
-            <option value="rejected">Rejected</option>
-          </select>
-
-          <select
-            value={userFilter}
-            onChange={(e) => {
-              setUserFilter(e.target.value);
-              setCurrentPage(1);
-            }}
-            style={styles.filterDropdown}
-          >
-            <option value="all">All Users ({uniqueUsers.length})</option>
+            <option value="all">{userFilters.length > 1 ? `${userFilters.length} users selected` : `All Users (${uniqueUsers.length})`}</option>
             {uniqueUsers.map((u) => (
               <option key={u} value={u}>
                 {u}
@@ -576,41 +596,63 @@ export default function SharedReportPage() {
             ))}
           </select>
 
-          <select
-            value={categoryFilter}
-            onChange={(e) => {
-              setCategoryFilter(e.target.value);
-              setCurrentPage(1);
-            }}
-            style={styles.filterDropdown}
-          >
-            <option value="all">All Categories ({uniqueCategories.length})</option>
-            {uniqueCategories.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
+          <select value={sourceFilter} onChange={(e) => { setSourceFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown}>
+            <option value="all">All Expense Types</option>
+            {uniqueSources.map((source) => <option key={source} value={source}>{source === "toPay" ? "To Pay" : source}</option>)}
           </select>
 
-          {isCombined && (
-            <select
-              value={typeFilter}
-              onChange={(e) => {
-                setTypeFilter(e.target.value);
-                setCurrentPage(1);
-              }}
-              style={styles.filterDropdown}
-            >
-              <option value="all">All Types</option>
-              <option value="expense">Expense</option>
-              <option value="credit">Credit</option>
-              <option value="debit">Debit</option>
-            </select>
-          )}
+          <input aria-label="From date" type="date" value={fromDateFilter}
+            onChange={(e) => { setFromDateFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown} />
+          <input aria-label="To date" type="date" value={toDateFilter}
+            onChange={(e) => { setToDateFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown} />
+
+          <button onClick={() => { setSearch(""); setStatusFilters([]); setUserFilters([]); setCategoryFilters(null); setTypeFilter("all"); setSourceFilter("all"); setFromDateFilter(""); setToDateFilter(""); setCurrentPage(1); }} style={styles.pageBtn}>
+            Reset filters
+          </button>
 
           <div style={{ marginLeft: "auto", fontSize: 13, color: "#64748b", fontWeight: 600 }}>
             Showing {filteredRows.length} of {rows.length}
           </div>
+        </div>
+
+        <div style={styles.quickFilterPanel}>
+          <div style={styles.filterGroup}>
+            <div style={styles.filterLabel}>Report Type</div>
+            <div style={styles.chipRow}>
+              {(["all", "expense", "credit", "debit"] as const).map((type) => {
+                const count = type === "all" ? rows.length : rows.filter((row) => row.type === type).length;
+                return <button key={type} onClick={() => { setTypeFilter(type); setCurrentPage(1); }} style={{ ...styles.filterChip, ...(typeFilter === type ? styles.filterChipActive : {}) }}>
+                  {type === "expense" ? "📊" : type === "credit" ? "💳" : type === "debit" ? "🧾" : "📈"} {type === "all" ? "Combined" : type[0].toUpperCase() + type.slice(1)} <strong>{count}</strong>
+                </button>;
+              })}
+            </div>
+          </div>
+
+          <div style={styles.filterGroup}>
+            <div style={styles.filterLabel}>Status</div>
+            <div style={styles.chipRow}>
+              {["pending", "approved", "rejected"].map((status) => <button key={status}
+                onClick={() => { setStatusFilters((current) => current.includes(status) ? current.filter((item) => item !== status) : [...current, status]); setCurrentPage(1); }}
+                style={{ ...styles.filterChip, ...(statusFilters.includes(status) ? styles.filterChipActive : {}) }}>{status[0].toUpperCase() + status.slice(1)}</button>)}
+            </div>
+          </div>
+
+          <details style={styles.advancedFilters}>
+            <summary style={styles.filterSummary}>Category and table-field filters</summary>
+            <div style={styles.filterGroup}>
+              <div style={styles.filterLabel}>Filter by Category <button onClick={() => setCategoryFilters(null)} style={styles.textBtn}>All</button> · <button onClick={() => setCategoryFilters([])} style={styles.textBtn}>None</button></div>
+              <div style={styles.chipRow}>{uniqueCategories.map((category) => <button key={category}
+                onClick={() => { setCategoryFilters((current) => current === null ? [category] : current.includes(category) ? current.filter((item) => item !== category) : [...current, category]); setCurrentPage(1); }}
+                style={{ ...styles.filterChip, ...(categoryFilters === null || categoryFilters.includes(category) ? styles.filterChipActive : {}) }}>{category}</button>)}</div>
+            </div>
+            <div style={styles.filterGroup}>
+              <div style={styles.filterLabel}>Table Fields <button onClick={() => setVisibleFields(["date", "user", "type", "source", "category", "site", "amount", "status", "description", "attachments"])} style={styles.textBtn}>All</button> · <button onClick={() => setVisibleFields(["date", "user", "site", "category", "amount", "status"])} style={styles.textBtn}>Default</button></div>
+              <div style={styles.chipRow}>{[
+                ["date", "Date"], ["user", "User"], ["type", "Type"], ["source", "Expense Type"], ["category", "Category"], ["site", "Site/Party"], ["amount", "Amount"], ["status", "Status"], ["description", "Description"], ["attachments", "Attachments"],
+              ].map(([field, label]) => <button key={field} onClick={() => setVisibleFields((current) => current.includes(field) ? current.filter((item) => item !== field) : [...current, field])}
+                style={{ ...styles.filterChip, ...(visibleFields.includes(field) ? styles.filterChipActive : {}) }}>{label}</button>)}</div>
+            </div>
+          </details>
         </div>
 
         {/* View Tabs */}
@@ -657,16 +699,16 @@ export default function SharedReportPage() {
                     <thead>
                       <tr style={styles.tableHeadRow}>
                         <th style={{ ...styles.th, width: 44, textAlign: "center" }}>#</th>
-                        <th style={styles.th}>Date</th>
-                        <th style={styles.th}>User</th>
-                        {isCombined && <th style={styles.th}>Type</th>}
-                        <th style={styles.th}>Source</th>
-                        <th style={styles.th}>Category</th>
-                        <th style={styles.th}>Site / Party</th>
-                        <th style={{ ...styles.th, textAlign: "right" }}>Amount</th>
-                        <th style={styles.th}>Status</th>
-                        <th style={styles.th}>Description / Remarks</th>
-                        <th style={{ ...styles.th, textAlign: "center" }}>Attachments</th>
+                        {visibleFields.includes("date") && <th style={styles.th}>Date</th>}
+                        {visibleFields.includes("user") && <th style={styles.th}>User</th>}
+                        {visibleFields.includes("type") && <th style={styles.th}>Type</th>}
+                        {visibleFields.includes("source") && <th style={styles.th}>Expense Type</th>}
+                        {visibleFields.includes("category") && <th style={styles.th}>Head / Category</th>}
+                        {visibleFields.includes("site") && <th style={styles.th}>Site / Party</th>}
+                        {visibleFields.includes("amount") && <th style={{ ...styles.th, textAlign: "right" }}>Amount</th>}
+                        {visibleFields.includes("status") && <th style={styles.th}>Status</th>}
+                        {visibleFields.includes("description") && <th style={styles.th}>Description / Remarks</th>}
+                        {visibleFields.includes("attachments") && <th style={{ ...styles.th, textAlign: "center" }}>Attachments</th>}
                       </tr>
                     </thead>
                     <tbody>
@@ -679,13 +721,13 @@ export default function SharedReportPage() {
                             <td style={{ ...styles.td, textAlign: "center", color: "#94a3b8", fontSize: 11 }}>
                               {globalIndex}
                             </td>
-                            <td style={{ ...styles.td, whiteSpace: "nowrap", fontWeight: 500 }}>
+                            {visibleFields.includes("date") && <td style={{ ...styles.td, whiteSpace: "nowrap", fontWeight: 500 }}>
                               {fmtDate(row.date)}
-                            </td>
-                            <td style={{ ...styles.td, fontWeight: 600, color: "#0f172a" }}>
+                            </td>}
+                            {visibleFields.includes("user") && <td style={{ ...styles.td, fontWeight: 600, color: "#0f172a" }}>
                               {row.userName || "—"}
-                            </td>
-                            {isCombined && (
+                            </td>}
+                            {visibleFields.includes("type") && (
                               <td style={styles.td}>
                                 <span
                                   style={{
@@ -701,17 +743,17 @@ export default function SharedReportPage() {
                                 </span>
                               </td>
                             )}
-                            <td style={{ ...styles.td, textTransform: "capitalize", color: "#64748b" }}>
+                            {visibleFields.includes("source") && <td style={{ ...styles.td, textTransform: "capitalize", color: "#64748b" }}>
                               {row.source || "—"}
-                            </td>
-                            <td style={styles.td}>
+                            </td>}
+                            {visibleFields.includes("category") && <td style={styles.td}>
                               <span style={styles.categoryPill}>{row.category || "—"}</span>
-                            </td>
-                            <td style={{ ...styles.td, color: "#334155" }}>{row.siteName || "—"}</td>
-                            <td style={{ ...styles.td, textAlign: "right", fontWeight: 700, color: theme.primary, fontVariantNumeric: "tabular-nums" }}>
+                            </td>}
+                            {visibleFields.includes("site") && <td style={{ ...styles.td, color: "#334155" }}>{row.siteName || "—"}</td>}
+                            {visibleFields.includes("amount") && <td style={{ ...styles.td, textAlign: "right", fontWeight: 700, color: theme.primary, fontVariantNumeric: "tabular-nums" }}>
                               {fmtINR(row.amount)}
-                            </td>
-                            <td style={styles.td}>
+                            </td>}
+                            {visibleFields.includes("status") && <td style={styles.td}>
                               <span
                                 style={{
                                   ...styles.badge,
@@ -722,11 +764,11 @@ export default function SharedReportPage() {
                               >
                                 {row.status || "—"}
                               </span>
-                            </td>
-                            <td style={{ ...styles.td, maxWidth: 260, color: "#475569", fontSize: 12 }}>
+                            </td>}
+                            {visibleFields.includes("description") && <td style={{ ...styles.td, maxWidth: 260, color: "#475569", fontSize: 12 }}>
                               {row.description || row.remarks || "—"}
-                            </td>
-                            <td style={{ ...styles.td, textAlign: "center" }}>
+                            </td>}
+                            {visibleFields.includes("attachments") && <td style={{ ...styles.td, textAlign: "center" }}>
                               {row.attachments && row.attachments.length > 0 ? (
                                 <div style={{ display: "flex", gap: 4, justifyContent: "center", flexWrap: "wrap" }}>
                                   {row.attachments.map((url, aIdx) => (
@@ -743,20 +785,16 @@ export default function SharedReportPage() {
                               ) : (
                                 <span style={{ color: "#cbd5e1" }}>—</span>
                               )}
-                            </td>
+                            </td>}
                           </tr>
                         );
                       })}
                     </tbody>
                     <tfoot>
                       <tr style={styles.tfootRow}>
-                        <td colSpan={isCombined ? 7 : 6} style={{ ...styles.td, fontWeight: 700, color: "#1e293b" }}>
-                          Total ({filteredRows.length} transactions)
+                        <td colSpan={Math.max(1, visibleFields.length + 1)} style={{ ...styles.td, fontWeight: 800, color: theme.primary, fontSize: 14 }}>
+                          Filtered total: {fmtINR(activeSummary.grandTotal)} · {filteredRows.length} transactions
                         </td>
-                        <td style={{ ...styles.td, textAlign: "right", fontWeight: 800, color: theme.primary, fontSize: 15 }}>
-                          {fmtINR(activeSummary.grandTotal)}
-                        </td>
-                        <td colSpan={3} style={styles.td} />
                       </tr>
                     </tfoot>
                   </table>
@@ -807,9 +845,12 @@ export default function SharedReportPage() {
         {activeTab === "user" && (
           <div style={styles.analysisGrid}>
             {byUserAnalysis.map(([name, data]) => {
-              const pct = calcPct(data.total, activeSummary.grandTotal);
+              const pct = calcPct(data.total, globalFacetTotal);
+              const selected = userFilters.includes(name);
               return (
-                <div key={name} style={styles.analysisCard}>
+                <button key={name} type="button" aria-pressed={selected}
+                  onClick={() => { setUserFilters((current) => current.includes(name) ? current.filter((item) => item !== name) : [...current, name]); setCurrentPage(1); }}
+                  style={{ ...styles.analysisCard, ...styles.analysisButton, ...(selected ? styles.analysisCardSelected : {}) }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
                     <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>👤 {name}</div>
                     <div style={{ fontWeight: 800, fontSize: 16, color: theme.primary }}>{fmtINR(data.total)}</div>
@@ -821,7 +862,8 @@ export default function SharedReportPage() {
                     <span>{data.count} transaction{data.count !== 1 ? "s" : ""}</span>
                     <span><strong>{pct}</strong> of total</span>
                   </div>
-                </div>
+                  <div style={styles.cardSelectionHint}>{selected ? "✓ Selected — click to remove" : "+ Add user to filter"}</div>
+                </button>
               );
             })}
           </div>
@@ -831,9 +873,12 @@ export default function SharedReportPage() {
         {activeTab === "category" && (
           <div style={styles.analysisGrid}>
             {byCategoryAnalysis.map(([cat, data]) => {
-              const pct = calcPct(data.total, activeSummary.grandTotal);
+              const pct = calcPct(data.total, userFacetTotal);
+              const selected = categoryFilters === null || categoryFilters.includes(cat);
               return (
-                <div key={cat} style={styles.analysisCard}>
+                <button key={cat} type="button" aria-pressed={selected}
+                  onClick={() => { setCategoryFilters((current) => current === null ? [cat] : current.includes(cat) ? current.filter((item) => item !== cat) : [...current, cat]); setCurrentPage(1); }}
+                  style={{ ...styles.analysisCard, ...styles.analysisButton, ...(selected && categoryFilters !== null ? styles.analysisCardSelected : {}) }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
                     <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>🏷️ {cat}</div>
                     <div style={{ fontWeight: 800, fontSize: 16, color: "#0891b2" }}>{fmtINR(data.total)}</div>
@@ -845,7 +890,8 @@ export default function SharedReportPage() {
                     <span>{data.count} item{data.count !== 1 ? "s" : ""}</span>
                     <span><strong>{pct}</strong> of total</span>
                   </div>
-                </div>
+                  <div style={styles.cardSelectionHint}>{categoryFilters === null ? "+ Click to focus this category" : selected ? "✓ Selected — click to remove" : "+ Add category to filter"}</div>
+                </button>
               );
             })}
           </div>
@@ -901,6 +947,8 @@ export default function SharedReportPage() {
               {previewImage.match(/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i) ? (
                 /* eslint-disable-next-line @next/next/no-img-element */
                 <img src={previewImage} alt="Attachment" style={styles.modalImg} />
+              ) : previewImage.match(/\.pdf(\?.*)?$/i) ? (
+                <iframe src={previewImage} title="PDF attachment" style={{ width: "100%", height: "75vh", border: 0, borderRadius: 8 }} />
               ) : (
                 <div style={{ textAlign: "center", padding: "40px 20px" }}>
                   <p style={{ color: "#475569", marginBottom: 16 }}>File preview not available for this format.</p>
@@ -1123,6 +1171,67 @@ const styles: Record<string, React.CSSProperties> = {
     color: "#1e293b",
     cursor: "pointer",
   },
+  quickFilterPanel: {
+    background: "#ffffff",
+    padding: "14px 16px",
+    borderRadius: 12,
+    border: "1px solid #e2e8f0",
+    marginBottom: 18,
+    boxShadow: "0 1px 2px rgba(15,23,42,.03)",
+  },
+  filterGroup: {
+    marginBottom: 12,
+  },
+  filterLabel: {
+    fontSize: 11,
+    fontWeight: 800,
+    color: "#475569",
+    textTransform: "uppercase",
+    letterSpacing: ".05em",
+    marginBottom: 8,
+  },
+  chipRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 7,
+  },
+  filterChip: {
+    padding: "7px 11px",
+    borderRadius: 8,
+    border: "1px solid #cbd5e1",
+    background: "#f8fafc",
+    color: "#475569",
+    fontSize: 12,
+    fontWeight: 650,
+    cursor: "pointer",
+    textTransform: "capitalize",
+  },
+  filterChipActive: {
+    background: "#eef2ff",
+    borderColor: "#818cf8",
+    color: "#4338ca",
+  },
+  advancedFilters: {
+    marginTop: 6,
+    paddingTop: 10,
+    borderTop: "1px solid #e2e8f0",
+  },
+  filterSummary: {
+    cursor: "pointer",
+    color: "#4f46e5",
+    fontSize: 12,
+    fontWeight: 750,
+    marginBottom: 12,
+  },
+  textBtn: {
+    border: 0,
+    background: "transparent",
+    color: "#4f46e5",
+    fontSize: 11,
+    fontWeight: 800,
+    cursor: "pointer",
+    padding: "2px 4px",
+  },
   tabNav: {
     display: "flex",
     gap: 6,
@@ -1245,6 +1354,26 @@ const styles: Record<string, React.CSSProperties> = {
     border: "1px solid #e2e8f0",
     padding: "16px 18px",
     boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+  },
+  analysisButton: {
+    width: "100%",
+    textAlign: "left",
+    fontFamily: "inherit",
+    cursor: "pointer",
+    transition: "border-color .15s ease, box-shadow .15s ease, transform .15s ease",
+  },
+  analysisCardSelected: {
+    border: "2px solid #6366f1",
+    background: "#f5f3ff",
+    boxShadow: "0 0 0 3px rgba(99,102,241,.10)",
+  },
+  cardSelectionHint: {
+    marginTop: 10,
+    paddingTop: 9,
+    borderTop: "1px solid #e2e8f0",
+    color: "#6366f1",
+    fontSize: 11,
+    fontWeight: 700,
   },
   progressTrack: {
     height: 7,

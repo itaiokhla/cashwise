@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/expense-reports",
-      "schedule": "30 3 * * *"
+      "schedule": "* * * * *"
     }
   ]
 }

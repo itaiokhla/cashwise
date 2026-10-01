@@ -16,7 +16,7 @@
  */
 
 const INTERVAL_MS = 60 * 1000; // 60 seconds
-const CRON_URL = process.env.CRON_URL || "http://localhost:3000/api/cron/expense-reports";
+const CRON_URL = process.env.CRON_URL || `http://localhost:${process.env.PORT || 3000}/api/cron/expense-reports`;
 const CRON_SECRET = process.env.CRON_SECRET || "";
 
 if (!CRON_SECRET) {

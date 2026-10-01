@@ -1,4 +1,4 @@
-import axios, { AxiosRequestConfig, InternalAxiosRequestConfig } from "axios";
+import axios, { InternalAxiosRequestConfig } from "axios";
 import {getCookie} from "cookies-next";
 
 
@@ -7,7 +7,9 @@ import {getCookie} from "cookies-next";
     
     // Create the Axios client
     const client = axios.create({
-        baseURL: process.env.NEXT_PUBLIC_BASE_URL,
+        // The API is served by the same Next.js application. A relative URL
+        // keeps authentication working on any local port and in production.
+        baseURL: "/api",
         headers: {
             Authorization: token ? `Bearer ${token}` : undefined 
         }

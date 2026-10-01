@@ -1,6 +1,6 @@
 // @app/_lib/email.ts
 import nodemailer from "nodemailer";
-import XLSX from "xlsx";
+import * as XLSX from "xlsx";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 

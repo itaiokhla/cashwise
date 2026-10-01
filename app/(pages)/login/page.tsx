@@ -64,7 +64,7 @@ const Login = () => {
       const role = getCookie("role");
       if (accessToken && role) {
         const path =
-          role === "admin"
+          role === "admin" || role === "manager"
             ? "/admin/account"
             : `/users/expenses/${user?._id ?? ""}`;
         window.location.href = path;
@@ -136,7 +136,7 @@ const Login = () => {
         localStorage.setItem("accessToken", response?.data?.accessToken);
         localStorage.setItem("role", UserRole);
         const path =
-          UserRole === "admin"
+          UserRole === "admin" || UserRole === "manager"
             ? "/admin/account"
             : `/users/expenses/${response.data?.user?._id}`;
         toast.success(response.data?.message);
