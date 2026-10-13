@@ -4,7 +4,7 @@ export async function creditMessageAlert(
   var1: string,
   var2: string,
   var3: string,
-  number:number
+  number: number
 ) {
   const response = await axios.post(
     "https://www.fast2sms.com/dev/bulkV2",
@@ -14,7 +14,7 @@ export async function creditMessageAlert(
       variables_values: `${var1}  | ${var2} |${var3}`,
       route: "dlt",
       numbers: `${7011616143},${9891402128},${number}`,
-    //   numbers: '7542918414',
+      //   numbers: '7542918414',
     }),
     {
       headers: {

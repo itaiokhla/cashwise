@@ -8,7 +8,14 @@ export interface IReportShareLink extends Document {
   expiresAt: Date;
   createdAt: Date;
   revokedAt?: Date | null;
+  /**
+   * Immutable copy of the report as emailed. Version 2 snapshots carry
+   * `sections` (one per daily/weekly/monthly window) and a single
+   * de-duplicated `rows` list; each section's rows are the rows inside its
+   * from/to dates. Version 1 snapshots only have `summary` + `rows`.
+   */
   snapshotData: {
+    version?: number;
     reportType: string;
     fromDate: string;
     toDate: string;
@@ -16,19 +23,23 @@ export interface IReportShareLink extends Document {
     recordCount: number;
     totalAmount: number;
     filters: Record<string, unknown>;
-    summary: {
-      expenseTotal: number;
-      creditTotal: number;
-      debitTotal: number;
-      grandTotal: number;
-      totalRecords: number;
-      averagePerEntry: number;
-      byUser: Record<string, { total: number; count: number }>;
-      byDate: Record<string, { total: number; count: number }>;
-      byCategory: Record<string, { total: number; count: number }>;
-    };
+    summary?: Record<string, unknown>;
+    sections?: {
+      key: string;
+      label: string;
+      from: string;
+      to: string;
+      rangeLabel: string;
+      digest: Record<string, unknown>;
+      cashPosition?: Record<string, unknown> | null;
+    }[];
     rows: unknown[];
     scheduleName?: string;
+    scheduleDescription?: string;
+    coverage?: string;
+    frequency?: string;
+    generatedAt?: string;
+    slotAt?: string | null;
     timezone?: string;
     recipients?: string[];
   };

@@ -1,38 +1,48 @@
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { DateTime } from "luxon";
 import Sidebar from "@app/_components/Sidebar";
-import Loader from "@app/_components/Loader";
 import { toast } from "react-toastify";
 import {
-  FiSettings,
-  FiMail,
-  FiClock,
+  FiActivity,
+  FiAlertTriangle,
   FiCalendar,
-  FiGlobe,
-  FiSend,
-  FiCheckCircle,
-  FiXCircle,
-  FiAlertCircle,
-  FiRefreshCw,
-  FiPlus,
-  FiTrash2,
-  FiCopy,
   FiCheck,
+  FiCheckCircle,
+  FiChevronDown,
+  FiClock,
+  FiCopy,
+  FiEdit2,
   FiExternalLink,
   FiFileText,
-  FiInfo,
-  FiEdit2,
   FiFilter,
+  FiInfo,
+  FiMail,
+  FiPlus,
+  FiRefreshCw,
+  FiSend,
+  FiTrash2,
   FiUsers,
-  FiLayers,
   FiX,
-  FiTag,
+  FiXCircle,
 } from "react-icons/fi";
+import {
+  WEEKDAYS,
+  computeNextRun,
+  describeCoverage,
+  describeSchedule,
+  getReportWindows,
+  type ReportCoverage,
+  type ReportPeriodMode,
+} from "@app/_lib/reportSchedule";
 
-// ─── Interfaces ───────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface IScheduledReportFilters {
+type ReportType = "expense" | "credit" | "debit" | "combined" | "office" | "travel" | "toPay" | "all";
+type Frequency = "daily" | "weekly" | "monthly";
+
+interface ScheduleFilters {
   userIds?: string[];
   expenseSources?: ("office" | "travel" | "toPay")[];
   categories?: string[];
@@ -43,35 +53,39 @@ export interface IScheduledReportFilters {
   search?: string;
 }
 
-export interface IScheduledReportData {
+interface Schedule {
   _id?: string;
   name: string;
-  reportType: "expense" | "credit" | "debit" | "combined" | "office" | "travel" | "toPay" | "all";
-  frequency: "daily" | "weekly" | "monthly";
+  reportType: ReportType;
+  frequency: Frequency;
   time: string;
   timezone: string;
+  dayOfWeek?: number;
+  dayOfMonth?: number;
   recipients: string[];
-  reportPeriod: "daily" | "weekly" | "monthly" | "all";
+  reportPeriod: ReportPeriodMode;
+  coverage?: ReportCoverage;
+  linkTtlHours?: number;
+  attachFiles?: boolean;
   enabled: boolean;
-  filters?: IScheduledReportFilters;
+  filters?: ScheduleFilters;
   lastRunAt?: string | null;
   lastSuccessAt?: string | null;
   lastFailedAt?: string | null;
   lastErrorMessage?: string | null;
+  consecutiveFailures?: number;
   nextRunAt?: string | null;
   createdAt?: string;
 }
 
-interface IExecutionHistory {
+interface Execution {
   _id: string;
   scheduleId?: string;
-  executionKey: string;
   reportType: string;
   period: string;
   fromDate: string;
   toDate: string;
   recipients: string[];
-  recipientCount: number;
   recordCount: number;
   totalAmount: number;
   status: "success" | "failed";
@@ -79,101 +93,158 @@ interface IExecutionHistory {
   pdfUrls: string[];
   shareUrl?: string | null;
   shareExpiresAt?: string | null;
+  sections?: { key: string; label: string; from: string; to: string; total: number; count: number }[];
   durationMs: number;
   executedAt: string;
   triggeredBy: "cron" | "manual_test" | "scheduler" | "manual_generate";
 }
 
-interface IUserItem {
-  _id: string;
-  name: string;
-  email?: string;
-  role?: string;
-  type?: string;
+interface SchedulerInfo {
+  lastTickAt: string | null;
+  lastTickSource: string;
+  lastTickSummary?: { due: number; sent: number; failed: number; skipped: number; durationMs: number };
+  lastSentAt: string | null;
+  tickCount: number;
 }
 
+interface UserItem {
+  _id: string;
+  name: string;
+  role?: string;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
 const TIMEZONES = [
-  { value: "Asia/Kolkata", label: "Asia/Kolkata (IST - UTC+05:30)" },
-  { value: "UTC", label: "UTC (Coordinated Universal Time)" },
-  { value: "America/New_York", label: "America/New_York (EST/EDT)" },
-  { value: "America/Los_Angeles", label: "America/Los_Angeles (PST/PDT)" },
-  { value: "America/Chicago", label: "America/Chicago (CST/CDT)" },
-  { value: "Europe/London", label: "Europe/London (GMT/BST)" },
-  { value: "Europe/Paris", label: "Europe/Paris (CET/CEST)" },
-  { value: "Asia/Dubai", label: "Asia/Dubai (GST - UTC+04:00)" },
-  { value: "Asia/Singapore", label: "Asia/Singapore (SGT - UTC+08:00)" },
-  { value: "Australia/Sydney", label: "Australia/Sydney (AEST - UTC+10:00)" },
+  { value: "Asia/Kolkata", label: "India (IST, UTC+5:30)" },
+  { value: "Asia/Dubai", label: "Dubai (GST, UTC+4)" },
+  { value: "Asia/Singapore", label: "Singapore (UTC+8)" },
+  { value: "Europe/London", label: "London (GMT/BST)" },
+  { value: "Europe/Paris", label: "Paris (CET/CEST)" },
+  { value: "America/New_York", label: "New York (EST/EDT)" },
+  { value: "America/Chicago", label: "Chicago (CST/CDT)" },
+  { value: "America/Los_Angeles", label: "Los Angeles (PST/PDT)" },
+  { value: "Australia/Sydney", label: "Sydney (AEST)" },
+  { value: "UTC", label: "UTC" },
 ];
 
-const DEFAULT_SCHEDULE: IScheduledReportData = {
-  name: "Daily Executive Expense Report",
+const SCOPES: { value: ReportType; label: string; hint: string }[] = [
+  { value: "expense", label: "All expenses", hint: "Office, travel and to-pay claims" },
+  { value: "combined", label: "Cash & expenses", hint: "Expenses + cash received/spent + cash in hand" },
+  { value: "office", label: "Office expenses", hint: "Office claims only" },
+  { value: "travel", label: "Travel expenses", hint: "Travel claims only" },
+  { value: "toPay", label: "To-pay (vendors)", hint: "Vendor / contractor payments" },
+  { value: "credit", label: "Cash received", hint: "Credit transactions only" },
+  { value: "debit", label: "Cash spent", hint: "Debit transactions only" },
+];
+
+const CONTENT_OPTIONS: { value: ReportPeriodMode; label: string; hint: string }[] = [
+  { value: "all", label: "Day + week + month", hint: "Three sections in one email" },
+  { value: "daily", label: "One day", hint: "A single day's entries" },
+  { value: "weekly", label: "One week", hint: "Monday to Sunday" },
+  { value: "monthly", label: "One month", hint: "Calendar month" },
+];
+
+const LINK_TTLS = [
+  { value: 24, label: "1 day" },
+  { value: 72, label: "3 days" },
+  { value: 168, label: "7 days" },
+  { value: 336, label: "14 days" },
+  { value: 720, label: "30 days" },
+];
+
+const CATEGORIES = [
+  "conveyance", "purchase", "food", "tea", "hotel", "labour", "contractor", "courier", "loading",
+  "porter", "cartage", "rider", "dailyWages", "transport", "maintenance", "other",
+];
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+const NEW_SCHEDULE: Schedule = {
+  name: "Daily Cash Expense Report",
   reportType: "expense",
   frequency: "daily",
   time: "19:00",
   timezone: "Asia/Kolkata",
-  recipients: ["itofficepulse@gmail.com"],
+  dayOfWeek: 1,
+  dayOfMonth: 1,
+  recipients: [],
   reportPeriod: "all",
+  coverage: "current",
+  linkTtlHours: 168,
+  attachFiles: true,
   enabled: true,
-  filters: {
-    userIds: [],
-    expenseSources: ["office", "travel", "toPay"],
-    categories: [],
-    statuses: ["approved", "pending"],
-    includeCredit: true,
-    includeDebit: true,
-  },
+  // All statuses: rejected claims are reported separately and never counted in totals.
+  filters: { userIds: [], expenseSources: [], categories: [], statuses: [], includeCredit: true, includeDebit: true },
 };
 
-const EXPENSE_CATEGORIES = [
-  "conveyance",
-  "purchase",
-  "food",
-  "tea",
-  "hotel",
-  "labour",
-  "courier",
-  "loading",
-  "porter",
-  "rider",
-  "maintenance",
-  "other",
-  "transport",
-  "cartage",
-  "dailyWages",
-];
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// ─── Main Page Component ──────────────────────────────────────────────────────
+function labelize(key: string) {
+  if (key === "toPay") return "To pay";
+  if (key === "dailyWages") return "Daily wages";
+  return key.charAt(0).toUpperCase() + key.slice(1);
+}
+
+function relative(iso?: string | null): string {
+  if (!iso) return "";
+  return DateTime.fromISO(iso).toRelative({ style: "short" }) || "";
+}
+
+function inZone(iso: string | null | undefined, zone: string, fmt = "ccc d LLL, h:mm a") {
+  if (!iso) return "—";
+  const dt = DateTime.fromISO(iso).setZone(zone);
+  return dt.isValid ? dt.toFormat(fmt) : "—";
+}
+
+function fmtINR(n: number | undefined) {
+  return "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function zoneShort(zone: string) {
+  const name = DateTime.now().setZone(zone).offsetNameShort || zone;
+  return zone === "Asia/Kolkata" ? "IST" : name;
+}
+
+const TRIGGER_LABEL: Record<Execution["triggeredBy"], string> = {
+  cron: "Scheduled",
+  scheduler: "Scheduled",
+  manual_test: "Sent manually",
+  manual_generate: "Sent manually",
+};
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
-  const [schedules, setSchedules] = useState<IScheduledReportData[]>([]);
-  const [usersList, setUsersList] = useState<IUserItem[]>([]);
-  const [history, setHistory] = useState<IExecutionHistory[]>([]);
-  const [historyLoading, setHistoryLoading] = useState(false);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
+  const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
+  const [env, setEnv] = useState({ emailConfigured: true, cronSecretConfigured: true, onVercel: false });
+  const [users, setUsers] = useState<UserItem[]>([]);
+  const [history, setHistory] = useState<Execution[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyPage, setHistoryPage] = useState(1);
-  const [copiedUrl, setCopiedUrl] = useState(false);
-
-  // Modal / Form state
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [modalMode, setModalMode] = useState<"create" | "edit">("create");
-  const [formData, setFormData] = useState<IScheduledReportData>(DEFAULT_SCHEDULE);
-  const [modalSaving, setModalSaving] = useState(false);
-  const [newEmail, setNewEmail] = useState("");
-  const [runningTestId, setRunningTestId] = useState<string | null>(null);
-
-  // ─── Data Fetching ──────────────────────────────────────────────────────────
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [sendingId, setSendingId] = useState<string | null>(null);
+  const [editor, setEditor] = useState<{ mode: "create" | "edit"; data: Schedule } | null>(null);
 
   const fetchSchedules = useCallback(async () => {
     try {
-      const res = await fetch("/api/settings/scheduled-reports");
+      const res = await fetch("/api/settings/scheduled-reports", { cache: "no-store" });
       const json = await res.json();
-      if (json.type === "SUCCESS" && Array.isArray(json.data)) {
-        setSchedules(json.data);
+      if (json.type === "SUCCESS") {
+        setSchedules(Array.isArray(json.data) ? json.data : []);
+        setScheduler(json.scheduler || null);
+        setEnv({
+          emailConfigured: json.emailConfigured !== false,
+          cronSecretConfigured: json.cronSecretConfigured !== false,
+          onVercel: !!json.onVercel,
+        });
+      } else {
+        toast.error(json.message || "Could not load report schedules");
       }
-    } catch (err) {
-      console.error("Failed to load scheduled reports:", err);
-      toast.error("Failed to load report schedules");
+    } catch {
+      toast.error("Could not load report schedules");
     }
   }, []);
 
@@ -181,28 +252,22 @@ export default function SettingsPage() {
     try {
       const res = await fetch("/api/users");
       const json = await res.json();
-      if (Array.isArray(json)) {
-        setUsersList(json);
-      } else if (json?.data && Array.isArray(json.data)) {
-        setUsersList(json.data);
-      }
-    } catch (err) {
-      console.error("Failed to load users for filter:", err);
+      setUsers(Array.isArray(json) ? json : Array.isArray(json?.data) ? json.data : []);
+    } catch {
+      /* the employee filter is optional */
     }
   }, []);
 
   const fetchHistory = useCallback(async (page = 1) => {
     try {
       setHistoryLoading(true);
-      const res = await fetch(`/api/settings/scheduled-reports/history?page=${page}&limit=10`);
+      const res = await fetch(`/api/settings/scheduled-reports/history?page=${page}&limit=10`, { cache: "no-store" });
       const json = await res.json();
       if (json.type === "SUCCESS" && json.data) {
         setHistory(json.data.executions || []);
         setHistoryTotal(json.data.total || 0);
         setHistoryPage(json.data.page || 1);
       }
-    } catch (err) {
-      console.error("Failed to load history:", err);
     } finally {
       setHistoryLoading(false);
     }
@@ -216,996 +281,927 @@ export default function SettingsPage() {
     })();
   }, [fetchSchedules, fetchUsers, fetchHistory]);
 
-  // ─── Actions ────────────────────────────────────────────────────────────────
+  const refreshAll = () => Promise.all([fetchSchedules(), fetchHistory(1)]);
 
-  const openCreateModal = () => {
-    setModalMode("create");
-    setFormData({
-      ...DEFAULT_SCHEDULE,
-      filters: {
-        userIds: [],
-        expenseSources: ["office", "travel", "toPay"],
-        categories: [],
-        statuses: ["approved", "pending"],
-        includeCredit: true,
-        includeDebit: true,
-      },
-    });
-    setNewEmail("");
-    setIsModalOpen(true);
-  };
-
-  const openEditModal = (sch: IScheduledReportData) => {
-    setModalMode("edit");
-    setFormData({
-      ...sch,
-      name: sch.name || "Automated Report",
-      filters: {
-        userIds: sch.filters?.userIds || [],
-        expenseSources: sch.filters?.expenseSources || ["office", "travel", "toPay"],
-        categories: sch.filters?.categories || [],
-        statuses: sch.filters?.statuses || ["approved", "pending"],
-        includeCredit: sch.filters?.includeCredit !== false,
-        includeDebit: sch.filters?.includeDebit !== false,
-      },
-    });
-    setNewEmail("");
-    setIsModalOpen(true);
-  };
-
-  const handleToggleSchedule = async (sch: IScheduledReportData) => {
-    if (!sch._id) return;
-    const newEnabled = !sch.enabled;
+  const toggleSchedule = async (s: Schedule) => {
+    const enabled = !s.enabled;
+    setSchedules((prev) => prev.map((x) => (x._id === s._id ? { ...x, enabled } : x)));
     try {
       const res = await fetch("/api/settings/scheduled-reports", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...sch, enabled: newEnabled }),
+        body: JSON.stringify({ ...s, enabled }),
       });
       const json = await res.json();
-      if (json.type === "SUCCESS") {
-        setSchedules((prev) =>
-          prev.map((s) => (s._id === sch._id ? { ...s, enabled: newEnabled } : s))
-        );
-        toast.success(`Schedule ${newEnabled ? "activated" : "paused"}`);
-      } else {
-        toast.error(json.message || "Failed to update schedule status");
-      }
-    } catch {
-      toast.error("Network error updating schedule");
+      if (json.type !== "SUCCESS") throw new Error(json.message);
+      toast.success(enabled ? "Schedule turned on" : "Schedule paused");
+      fetchSchedules();
+    } catch (err) {
+      setSchedules((prev) => prev.map((x) => (x._id === s._id ? { ...x, enabled: !enabled } : x)));
+      toast.error((err as Error).message || "Could not update the schedule");
     }
   };
 
-  const handleDeleteSchedule = async (id: string, name: string) => {
-    if (!window.confirm(`Are you sure you want to delete "${name}"?`)) return;
+  const deleteSchedule = async (s: Schedule) => {
+    if (!s._id || !window.confirm(`Delete “${s.name}”? Recipients will stop receiving this report.`)) return;
     try {
-      const res = await fetch(`/api/settings/scheduled-reports?id=${id}`, {
-        method: "DELETE",
-      });
+      const res = await fetch(`/api/settings/scheduled-reports?id=${s._id}`, { method: "DELETE" });
       const json = await res.json();
-      if (json.type === "SUCCESS") {
-        setSchedules((prev) => prev.filter((s) => s._id !== id));
-        toast.success("Schedule deleted successfully");
-      } else {
-        toast.error(json.message || "Failed to delete schedule");
-      }
-    } catch {
-      toast.error("Network error deleting schedule");
+      if (json.type !== "SUCCESS") throw new Error(json.message);
+      setSchedules((prev) => prev.filter((x) => x._id !== s._id));
+      toast.success("Schedule deleted");
+    } catch (err) {
+      toast.error((err as Error).message || "Could not delete the schedule");
     }
   };
 
-  const handleRunNow = async (sch: IScheduledReportData) => {
-    if (!sch._id) return;
+  const sendNow = async (s: Schedule) => {
+    if (!s._id) return;
+    if (!window.confirm(`Send “${s.name}” now to ${s.recipients.length} recipient${s.recipients.length === 1 ? "" : "s"}?\n\nThis does not change the regular schedule.`)) return;
+    setSendingId(s._id);
     try {
-      setRunningTestId(sch._id);
       const res = await fetch("/api/settings/scheduled-reports/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scheduleId: sch._id,
-          reportType: sch.reportType,
-          period: sch.reportPeriod,
-          timezone: sch.timezone,
-          recipients: sch.recipients,
-          filters: sch.filters,
-        }),
+        body: JSON.stringify({ scheduleId: s._id }),
       });
       const json = await res.json();
-      if (json.type === "SUCCESS") {
-        toast.success(
-          `Report generated & sent! ${json.data?.recordCount ?? 0} records dispatched to ${sch.recipients.length} recipients.`
-        );
-        fetchHistory(1);
-        fetchSchedules();
-      } else {
-        toast.error(json.message || "Failed to generate test report");
-      }
-    } catch {
-      toast.error("Network error running test report");
+      if (json.type !== "SUCCESS") throw new Error(json.message);
+      toast.success(`Report emailed to ${json.data.recipients.length} recipient(s)`);
+      refreshAll();
+    } catch (err) {
+      toast.error((err as Error).message || "Sending failed");
+      fetchHistory(1);
     } finally {
-      setRunningTestId(null);
+      setSendingId(null);
     }
   };
 
-  const handleSaveModal = async () => {
-    if (!formData.name.trim()) {
-      toast.error("Please enter a schedule name");
-      return;
-    }
-    if (formData.recipients.length === 0) {
-      toast.error("Please add at least one recipient email");
-      return;
-    }
-
-    try {
-      setModalSaving(true);
-      const method = modalMode === "create" ? "POST" : "PUT";
-      const res = await fetch("/api/settings/scheduled-reports", {
-        method,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
-      });
-      const json = await res.json();
-
-      if (json.type === "SUCCESS") {
-        toast.success(
-          modalMode === "create"
-            ? "Automated report schedule created!"
-            : "Schedule updated successfully!"
-        );
-        setIsModalOpen(false);
-        fetchSchedules();
-      } else {
-        toast.error(json.message || "Failed to save schedule");
-      }
-    } catch (err: any) {
-      toast.error(err.message || "Network error while saving schedule");
-    } finally {
-      setModalSaving(false);
-    }
-  };
-
-  // Recipient Tag Handlers
-  const handleAddEmail = () => {
-    const trimmed = newEmail.trim().toLowerCase();
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!trimmed) return;
-    if (!emailRegex.test(trimmed)) {
-      toast.error("Please enter a valid email address");
-      return;
-    }
-    if (formData.recipients.includes(trimmed)) {
-      toast.warning("Email already added");
-      return;
-    }
-    setFormData((prev) => ({
-      ...prev,
-      recipients: [...prev.recipients, trimmed],
-    }));
-    setNewEmail("");
-  };
-
-  const handleRemoveEmail = (email: string) => {
-    setFormData((prev) => ({
-      ...prev,
-      recipients: prev.recipients.filter((e) => e !== email),
-    }));
-  };
-
-  // Filter Toggle Handlers
-  const toggleSourceFilter = (source: "office" | "travel" | "toPay") => {
-    setFormData((prev) => {
-      const current = prev.filters?.expenseSources || [];
-      const updated = current.includes(source)
-        ? current.filter((s) => s !== source)
-        : [...current, source];
-      return {
-        ...prev,
-        filters: { ...prev.filters, expenseSources: updated },
-      };
-    });
-  };
-
-  const toggleStatusFilter = (status: "pending" | "approved" | "rejected") => {
-    setFormData((prev) => {
-      const current = prev.filters?.statuses || [];
-      const updated = current.includes(status)
-        ? current.filter((s) => s !== status)
-        : [...current, status];
-      return {
-        ...prev,
-        filters: { ...prev.filters, statuses: updated },
-      };
-    });
-  };
-
-  const toggleUserFilter = (userId: string) => {
-    setFormData((prev) => {
-      const current = prev.filters?.userIds || [];
-      const updated = current.includes(userId)
-        ? current.filter((u) => u !== userId)
-        : [...current, userId];
-      return {
-        ...prev,
-        filters: { ...prev.filters, userIds: updated },
-      };
-    });
-  };
-
-  const toggleCategoryFilter = (cat: string) => {
-    setFormData((prev) => {
-      const current = prev.filters?.categories || [];
-      const updated = current.includes(cat)
-        ? current.filter((c) => c !== cat)
-        : [...current, cat];
-      return {
-        ...prev,
-        filters: { ...prev.filters, categories: updated },
-      };
-    });
-  };
-
-  const copyCronUrl = () => {
-    const origin = typeof window !== "undefined" ? window.location.origin : "";
-    const url = `${origin}/api/cron/expense-reports`;
-    navigator.clipboard.writeText(url);
-    setCopiedUrl(true);
-    toast.info("Cron webhook URL copied to clipboard");
-    setTimeout(() => setCopiedUrl(false), 2000);
-  };
+  const activeCount = schedules.filter((s) => s.enabled).length;
 
   return (
-    <section className="flex flex-col bg-slate-50 min-h-screen">
-      <div className="flex flex-col md:flex-row flex-grow min-h-0">
+    <section className="flex min-h-screen flex-col bg-slate-50">
+      <div className="flex min-h-0 flex-grow flex-col md:flex-row">
         <Sidebar />
 
-        <main className="flex-1 flex flex-col min-h-0 overflow-y-auto">
-          {loading && <Loader />}
-
-          {/* Top Page Header */}
-          <div className="bg-white border-b border-slate-200 px-6 py-4 sticky top-0 z-10">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-purple-100 flex items-center justify-center text-purple-600 shadow-sm">
-                  <FiSettings className="w-5 h-5" />
-                </div>
-                <div>
-                  <h1 className="text-xl font-bold text-slate-900 leading-tight">
-                    Automated Reporting System
-                  </h1>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Configure automated scheduled reports, email dispatches, and 24-hour secure shareable links.
-                  </p>
-                </div>
+        <main className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-16">
+          {/* Page header */}
+          <div className="sticky top-0 z-10 border-b border-slate-200 bg-white/95 backdrop-blur">
+            <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-3 sm:px-6">
+              <div className="min-w-0">
+                <h1 className="truncate text-lg font-bold text-slate-900 sm:text-xl">Automated Reports</h1>
+                <p className="hidden text-xs text-slate-500 sm:block">
+                  Email daily, weekly or monthly expense reports automatically — with a shareable link, PDF and Excel.
+                </p>
               </div>
-
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={openCreateModal}
-                  className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-xl bg-purple-600 text-white hover:bg-purple-700 shadow-sm shadow-purple-200 transition-all"
-                >
-                  <FiPlus className="w-4 h-4" />
-                  Create New Schedule
-                </button>
-              </div>
+              <button
+                onClick={() => setEditor({ mode: "create", data: structuredClone(NEW_SCHEDULE) })}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700"
+              >
+                <FiPlus className="h-4 w-4" /> <span>New schedule</span>
+              </button>
             </div>
           </div>
 
-          <div className="p-6 max-w-7xl mx-auto w-full space-y-6">
-            {/* Executive Status Banner */}
-            <div className="bg-gradient-to-r from-purple-900 via-indigo-900 to-slate-900 rounded-2xl p-6 text-white shadow-md relative overflow-hidden">
-              <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-6">
-                <div>
-                  <div className="flex items-center gap-2 mb-2">
-                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                      {schedules.filter((s) => s.enabled).length} Active Schedule(s)
-                    </span>
-                    <span className="text-xs text-slate-300">
-                      Total Configured: <strong className="text-white">{schedules.length}</strong>
-                    </span>
-                  </div>
-                  <h2 className="text-lg md:text-xl font-bold tracking-tight">
-                    Scheduled Expense Reporting Engine
-                  </h2>
-                  <p className="text-xs text-slate-300 max-w-2xl mt-1 leading-relaxed">
-                    Automatically compiles travel, office, and vendor payments, generates executive PDF summaries,
-                    uploads snapshots, and sends emails with 24-hour secure read-only web report links.
-                  </p>
-                </div>
+          <div className="mx-auto w-full max-w-6xl space-y-5 px-4 py-5 sm:px-6">
+            <SchedulerHealth scheduler={scheduler} env={env} activeCount={activeCount} onRefresh={refreshAll} />
 
-                <div className="flex flex-wrap gap-3 text-xs shrink-0">
-                  <div className="bg-white/10 backdrop-blur-sm rounded-xl px-4 py-3 border border-white/10">
-                    <div className="text-slate-400 text-[10px] uppercase font-semibold">Cron Endpoint</div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <code className="text-purple-300 font-mono text-[11px]">/api/cron/expense-reports</code>
-                      <button
-                        onClick={copyCronUrl}
-                        className="text-slate-400 hover:text-white transition-colors"
-                        title="Copy Cron URL"
-                      >
-                        {copiedUrl ? <FiCheck className="w-3.5 h-3.5 text-emerald-400" /> : <FiCopy className="w-3.5 h-3.5" />}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Configured Schedules Section */}
-            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
-              <div className="flex items-center justify-between pb-4 mb-5 border-b border-slate-100">
+            {/* Schedules */}
+            <section>
+              <div className="mb-3 flex items-end justify-between">
                 <div>
-                  <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                    <FiCalendar className="w-4 h-4 text-purple-600" />
-                    Configured Report Schedules
-                  </h2>
+                  <h2 className="text-base font-bold text-slate-900">Schedules</h2>
                   <p className="text-xs text-slate-500">
-                    Manage automated schedules, recipient lists, and target expense categories
+                    {schedules.length === 0 ? "No schedules yet" : `${activeCount} active · ${schedules.length} total`}
                   </p>
                 </div>
-                <button
-                  onClick={openCreateModal}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-purple-50 text-purple-700 hover:bg-purple-100 transition-colors"
-                >
-                  <FiPlus className="w-3.5 h-3.5" /> Add Schedule
-                </button>
               </div>
 
-              {schedules.length === 0 ? (
-                <div className="text-center py-12 px-4">
-                  <div className="w-12 h-12 rounded-full bg-purple-50 text-purple-600 flex items-center justify-center mx-auto mb-3 text-xl">
-                    ⏱️
-                  </div>
-                  <h3 className="text-sm font-bold text-slate-800">No Scheduled Reports Configured</h3>
-                  <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
-                    Create your first automated report schedule to deliver daily or weekly executive summaries automatically.
-                  </p>
-                  <button
-                    onClick={openCreateModal}
-                    className="mt-4 px-4 py-2 text-xs font-semibold rounded-xl bg-purple-600 text-white hover:bg-purple-700 shadow-sm"
-                  >
-                    + Create First Schedule
-                  </button>
+              {loading ? (
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                  {[0, 1, 2].map((i) => <div key={i} className="h-60 animate-pulse rounded-2xl bg-slate-200" />)}
                 </div>
+              ) : schedules.length === 0 ? (
+                <EmptySchedules onCreate={() => setEditor({ mode: "create", data: structuredClone(NEW_SCHEDULE) })} />
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {schedules.map((sch) => {
-                    const isRunning = runningTestId === sch._id;
-                    return (
-                      <div
-                        key={sch._id}
-                        className={`rounded-xl border p-5 transition-all flex flex-col justify-between ${
-                          sch.enabled
-                            ? "bg-white border-slate-200 hover:border-purple-300 shadow-sm"
-                            : "bg-slate-50/70 border-slate-200 opacity-75"
-                        }`}
-                      >
-                        <div>
-                          {/* Schedule Card Header */}
-                          <div className="flex items-start justify-between gap-3 mb-2">
-                            <div>
-                              <h3 className="text-sm font-bold text-slate-900 leading-snug">
-                                {sch.name || "Automated Report"}
-                              </h3>
-                              <div className="flex items-center gap-2 mt-1 flex-wrap">
-                                <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-purple-100 text-purple-700">
-                                  {sch.frequency} · {sch.time}
-                                </span>
-                                <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-600">
-                                  {sch.reportType}
-                                </span>
-                              </div>
-                            </div>
-
-                            {/* Active switch */}
-                            <button
-                              type="button"
-                              onClick={() => handleToggleSchedule(sch)}
-                              title={sch.enabled ? "Disable schedule" : "Enable schedule"}
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                                sch.enabled ? "bg-purple-600" : "bg-slate-300"
-                              }`}
-                            >
-                              <span
-                                className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                                  sch.enabled ? "translate-x-4" : "translate-x-0"
-                                }`}
-                              />
-                            </button>
-                          </div>
-
-                          {/* Details */}
-                          <div className="space-y-1.5 text-xs text-slate-600 mt-3 pt-3 border-t border-slate-100">
-                            <div className="flex items-center gap-1.5 text-[11px]">
-                              <FiGlobe className="w-3 h-3 text-slate-400" />
-                              <span className="truncate">{sch.timezone}</span>
-                            </div>
-
-                            <div className="flex items-center gap-1.5 text-[11px]">
-                              <FiMail className="w-3 h-3 text-slate-400" />
-                              <span className="truncate">
-                                {sch.recipients.length} Recipient{sch.recipients.length !== 1 ? "s" : ""} (
-                                {sch.recipients[0]}
-                                {sch.recipients.length > 1 ? `, +${sch.recipients.length - 1}` : ""})
-                              </span>
-                            </div>
-
-                            {/* Filters summary */}
-                            <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
-                              <FiFilter className="w-3 h-3 text-slate-400" />
-                              <span>
-                                {sch.filters?.userIds && sch.filters.userIds.length > 0
-                                  ? `${sch.filters.userIds.length} users`
-                                  : "All users"}
-                                {" · "}
-                                {sch.filters?.expenseSources && sch.filters.expenseSources.length > 0
-                                  ? sch.filters.expenseSources.join(", ")
-                                  : "All sources"}
-                              </span>
-                            </div>
-
-                            {/* Run info */}
-                            <div className="text-[10px] text-slate-400 pt-1">
-                              {sch.nextRunAt && sch.enabled ? (
-                                <span>
-                                  Next run:{" "}
-                                  <strong className="text-slate-700">
-                                    {new Date(sch.nextRunAt).toLocaleString("en-IN", {
-                                      dateStyle: "short",
-                                      timeStyle: "short",
-                                    })}
-                                  </strong>
-                                </span>
-                              ) : (
-                                <span>Status: {sch.enabled ? "Active" : "Paused"}</span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Actions */}
-                        <div className="flex items-center justify-between gap-2 mt-4 pt-3 border-t border-slate-100">
-                          <button
-                            onClick={() => handleRunNow(sch)}
-                            disabled={isRunning}
-                            className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-100 hover:bg-purple-50 text-slate-700 hover:text-purple-700 transition-colors disabled:opacity-50"
-                            title="Generate and send report immediately"
-                          >
-                            <FiSend className={`w-3 h-3 ${isRunning ? "animate-spin" : ""}`} />
-                            {isRunning ? "Sending..." : "Send Now"}
-                          </button>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => openEditModal(sch)}
-                              className="p-1.5 text-slate-500 hover:text-purple-600 rounded-lg hover:bg-slate-100 transition-colors"
-                              title="Edit schedule configuration"
-                            >
-                              <FiEdit2 className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => sch._id && handleDeleteSchedule(sch._id, sch.name || "this schedule")}
-                              className="p-1.5 text-slate-400 hover:text-red-600 rounded-lg hover:bg-red-50 transition-colors"
-                              title="Delete schedule"
-                            >
-                              <FiTrash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                  {schedules.map((s) => (
+                    <ScheduleCard
+                      key={s._id}
+                      schedule={s}
+                      sending={sendingId === s._id}
+                      onToggle={() => toggleSchedule(s)}
+                      onEdit={() => setEditor({ mode: "edit", data: structuredClone(s) })}
+                      onDelete={() => deleteSchedule(s)}
+                      onSend={() => sendNow(s)}
+                    />
+                  ))}
                 </div>
               )}
-            </div>
+            </section>
 
-            {/* Execution History Table */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-              <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
-                <div>
-                  <h3 className="text-base font-bold text-slate-900">Recent Report Execution History</h3>
-                  <p className="text-xs text-slate-500">
-                    Audit log of cron triggers, manual dispatches, PDF uploads, and 24-hour shareable links
-                  </p>
-                </div>
-                <button
-                  onClick={() => fetchHistory(historyPage)}
-                  disabled={historyLoading}
-                  className="p-2 border border-slate-200 rounded-xl hover:bg-slate-50 text-slate-600 hover:text-purple-600 transition-all"
-                  title="Refresh History"
-                >
-                  <FiRefreshCw className={`w-4 h-4 ${historyLoading ? "animate-spin" : ""}`} />
-                </button>
-              </div>
-
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="bg-slate-50 border-b border-slate-100 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-                      <th className="px-6 py-3">Timestamp</th>
-                      <th className="px-6 py-3">Trigger</th>
-                      <th className="px-6 py-3">Scope / Period</th>
-                      <th className="px-6 py-3">Recipients</th>
-                      <th className="px-6 py-3">Records & Total</th>
-                      <th className="px-6 py-3">Status</th>
-                      <th className="px-6 py-3">Share Link & PDFs</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
-                    {history.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="px-6 py-8 text-center text-slate-400">
-                          {historyLoading ? "Loading execution logs..." : "No execution history recorded yet."}
-                        </td>
-                      </tr>
-                    ) : (
-                      history.map((row) => {
-                        const isExpired =
-                          row.shareExpiresAt && new Date(row.shareExpiresAt) < new Date();
-
-                        return (
-                          <tr key={row._id} className="hover:bg-slate-50/80 transition-colors">
-                            <td className="px-6 py-3 font-medium text-slate-900 whitespace-nowrap">
-                              {new Date(row.executedAt).toLocaleString("en-IN", {
-                                dateStyle: "short",
-                                timeStyle: "short",
-                              })}
-                            </td>
-                            <td className="px-6 py-3 whitespace-nowrap">
-                              <span
-                                className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                  row.triggeredBy === "cron"
-                                    ? "bg-blue-50 text-blue-700 border border-blue-200"
-                                    : row.triggeredBy === "manual_test"
-                                    ? "bg-purple-50 text-purple-700 border border-purple-200"
-                                    : "bg-slate-100 text-slate-700"
-                                }`}
-                              >
-                                {row.triggeredBy}
-                              </span>
-                            </td>
-                            <td className="px-6 py-3 capitalize whitespace-nowrap">
-                              <span className="font-semibold">{row.reportType}</span> ({row.period})
-                            </td>
-                            <td className="px-6 py-3">
-                              <div className="max-w-[180px] truncate" title={row.recipients?.join(", ")}>
-                                {row.recipients?.join(", ") || "—"}
-                              </div>
-                            </td>
-                            <td className="px-6 py-3 whitespace-nowrap font-medium">
-                              {row.recordCount} records (₹{row.totalAmount?.toLocaleString("en-IN")})
-                            </td>
-                            <td className="px-6 py-3 whitespace-nowrap">
-                              {row.status === "success" ? (
-                                <span className="inline-flex items-center gap-1 text-emerald-600 font-semibold">
-                                  <FiCheckCircle className="w-3.5 h-3.5" /> Success
-                                </span>
-                              ) : (
-                                <span
-                                  className="inline-flex items-center gap-1 text-red-600 font-semibold cursor-help"
-                                  title={row.errorMessage || "Failed"}
-                                >
-                                  <FiXCircle className="w-3.5 h-3.5" /> Failed
-                                </span>
-                              )}
-                            </td>
-                            <td className="px-6 py-3 whitespace-nowrap">
-                              <div className="flex items-center gap-2">
-                                {/* Shared Report Link */}
-                                {row.shareUrl ? (
-                                  <a
-                                    href={row.shareUrl}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded font-medium text-[11px] border transition-colors ${
-                                      isExpired
-                                        ? "bg-slate-100 text-slate-400 border-slate-200 hover:text-slate-600"
-                                        : "bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border-indigo-200"
-                                    }`}
-                                    title={isExpired ? "Share link expired (24h limit)" : "Open public 24-hour shared dashboard"}
-                                  >
-                                    <FiExternalLink className="w-3 h-3" />
-                                    {isExpired ? "Report (Expired)" : "View Web Report"}
-                                  </a>
-                                ) : null}
-
-                                {/* PDF Download */}
-                                {row.pdfUrls && row.pdfUrls.length > 0 && (
-                                  <a
-                                    href={row.pdfUrls[0]}
-                                    target="_blank"
-                                    rel="noreferrer"
-                                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-purple-50 text-purple-700 hover:bg-purple-100 border border-purple-200 font-medium text-[11px]"
-                                    title="Download PDF"
-                                  >
-                                    <FiFileText className="w-3 h-3" /> PDF
-                                  </a>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* History Pagination */}
-              {historyTotal > 10 && (
-                <div className="px-6 py-3 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
-                  <span>
-                    Showing {history.length} of {historyTotal} runs
-                  </span>
-                  <div className="flex gap-1">
-                    <button
-                      disabled={historyPage <= 1}
-                      onClick={() => fetchHistory(historyPage - 1)}
-                      className="px-2.5 py-1 border rounded hover:bg-slate-50 disabled:opacity-40"
-                    >
-                      Prev
-                    </button>
-                    <button
-                      disabled={historyPage * 10 >= historyTotal}
-                      onClick={() => fetchHistory(historyPage + 1)}
-                      className="px-2.5 py-1 border rounded hover:bg-slate-50 disabled:opacity-40"
-                    >
-                      Next
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
+            <HistorySection
+              history={history}
+              total={historyTotal}
+              page={historyPage}
+              loading={historyLoading}
+              onPage={fetchHistory}
+            />
           </div>
         </main>
       </div>
 
-      {/* ─── Schedule Builder Modal ─────────────────────────────────────────── */}
-      {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto">
-          <div className="bg-white rounded-2xl max-w-2xl w-full border border-slate-200 shadow-2xl overflow-hidden my-8">
-            {/* Modal Header */}
-            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-              <div>
-                <h3 className="text-base font-bold text-slate-900">
-                  {modalMode === "create" ? "Create Automated Report Schedule" : "Edit Report Schedule"}
-                </h3>
-                <p className="text-xs text-slate-500">
-                  Configure dispatch timing, target recipients, and specific data filters
-                </p>
-              </div>
-              <button
-                onClick={() => setIsModalOpen(false)}
-                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
-              >
-                <FiX className="w-5 h-5" />
-              </button>
+      {editor && (
+        <ScheduleEditor
+          mode={editor.mode}
+          initial={editor.data}
+          users={users}
+          onClose={() => setEditor(null)}
+          onSaved={() => {
+            setEditor(null);
+            refreshAll();
+          }}
+          onTestSent={() => fetchHistory(1)}
+        />
+      )}
+    </section>
+  );
+}
+
+// ─── Scheduler health ─────────────────────────────────────────────────────────
+
+function SchedulerHealth({ scheduler, env, activeCount, onRefresh }: {
+  scheduler: SchedulerInfo | null;
+  env: { emailConfigured: boolean; cronSecretConfigured: boolean; onVercel: boolean };
+  activeCount: number;
+  onRefresh: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const lastTick = scheduler?.lastTickAt ? DateTime.fromISO(scheduler.lastTickAt) : null;
+  const minutesSince = lastTick ? -lastTick.diffNow("minutes").minutes : Infinity;
+  const healthy = minutesSince <= 130;
+  const sourceLabel: Record<string, string> = {
+    "vercel-cron": "Vercel Cron",
+    external: "external scheduler",
+    "local-scheduler": "local scheduler",
+  };
+
+  const problems: string[] = [];
+  if (!env.emailConfigured) problems.push("Email is not configured — set EMAIL_USER and EMAIL_PASS (Gmail app password) in the server environment.");
+  if (env.onVercel && !env.cronSecretConfigured) problems.push("CRON_SECRET is missing on Vercel — scheduled runs will be rejected. Add it under Project → Settings → Environment Variables.");
+  if (activeCount > 0 && !healthy) {
+    problems.push(
+      lastTick
+        ? `The scheduler last ran ${relative(scheduler!.lastTickAt)}. Reports are only sent while it runs.`
+        : "The scheduler has not run yet. After deploying to Vercel it starts automatically; locally run “npm run scheduler”."
+    );
+  }
+
+  const ok = problems.length === 0;
+  return (
+    <section className={`rounded-2xl p-4 ring-1 sm:p-5 ${ok ? "bg-white ring-slate-200" : "bg-amber-50 ring-amber-200"}`}>
+      <div className="flex items-start gap-3">
+        <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${ok ? "bg-green-50 text-green-700" : "bg-amber-100 text-amber-700"}`}>
+          {ok ? <FiActivity className="h-5 w-5" /> : <FiAlertTriangle className="h-5 w-5" />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-bold text-slate-900">
+              {ok ? "Automatic delivery is running" : "Automatic delivery needs attention"}
+            </h2>
+            <button onClick={onRefresh} className="inline-flex items-center gap-1 text-xs font-semibold text-slate-500 hover:text-indigo-600">
+              <FiRefreshCw className="h-3.5 w-3.5" /> Refresh
+            </button>
+          </div>
+          {lastTick && (
+            <p className="mt-0.5 text-xs text-slate-600">
+              Last check {relative(scheduler!.lastTickAt)} via {sourceLabel[scheduler!.lastTickSource] || scheduler!.lastTickSource}
+              {scheduler?.lastSentAt && <> · last email sent {relative(scheduler.lastSentAt)}</>}
+            </p>
+          )}
+          {problems.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs text-amber-900">
+              {problems.map((p) => (
+                <li key={p} className="flex gap-1.5"><span>•</span><span>{p}</span></li>
+              ))}
+            </ul>
+          )}
+          <button onClick={() => setOpen((o) => !o)} className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-indigo-600">
+            <FiInfo className="h-3.5 w-3.5" /> When exactly are emails sent?
+            <FiChevronDown className={`h-3.5 w-3.5 transition ${open ? "rotate-180" : ""}`} />
+          </button>
+          {open && (
+            <div className="mt-2 space-y-1.5 rounded-xl bg-slate-50 p-3 text-xs leading-relaxed text-slate-600">
+              <p>
+                Every report is sent <strong>once, at or after its scheduled time</strong>, and always covers the dates it promises — even if the check runs late.
+              </p>
+              <p>
+                On Vercel’s free (Hobby) plan the check runs once an hour, so an email scheduled for 7:00 PM arrives between 7:00 and about 8:00 PM.
+                For delivery within a minute, upgrade to Vercel Pro or point a free uptime/cron service (e.g. cron-job.org) at
+                <code className="mx-1 rounded bg-white px-1 py-0.5 text-[11px] ring-1 ring-slate-200">/api/cron/expense-reports</code>
+                every 5 minutes with the header <code className="rounded bg-white px-1 py-0.5 text-[11px] ring-1 ring-slate-200">Authorization: Bearer &lt;CRON_SECRET&gt;</code>.
+              </p>
             </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
 
-            {/* Modal Body */}
-            <div className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
-              {/* Schedule Name */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                  Schedule Name *
-                </label>
-                <input
-                  type="text"
-                  value={formData.name}
-                  onChange={(e) => setFormData((p) => ({ ...p, name: e.target.value }))}
-                  placeholder="e.g. Daily Operations Expense Summary"
-                  className="w-full px-3.5 py-2 text-sm border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500"
-                />
+function EmptySchedules({ onCreate }: { onCreate: () => void }) {
+  return (
+    <div className="rounded-2xl border-2 border-dashed border-slate-200 bg-white px-6 py-12 text-center">
+      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+        <FiMail className="h-6 w-6" />
+      </div>
+      <h3 className="mt-3 text-base font-bold text-slate-900">Get expense reports by email</h3>
+      <p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">
+        Choose who receives it and when. Each email has the day’s, week’s and month’s totals, a shareable link, PDF and Excel.
+      </p>
+      <button onClick={onCreate} className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700">
+        <FiPlus className="h-4 w-4" /> Create your first schedule
+      </button>
+    </div>
+  );
+}
+
+// ─── Schedule card ────────────────────────────────────────────────────────────
+
+function ScheduleCard({ schedule: s, sending, onToggle, onEdit, onDelete, onSend }: {
+  schedule: Schedule;
+  sending: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onSend: () => void;
+}) {
+  const zone = s.timezone || "Asia/Kolkata";
+  const scope = SCOPES.find((x) => x.value === s.reportType)?.label || labelize(s.reportType);
+  const coverage = s.coverage || "previous";
+  const windows = s.nextRunAt ? getReportWindows(s.reportPeriod, coverage, new Date(s.nextRunAt), zone) : [];
+  const failing = !!s.lastErrorMessage && (!s.lastSuccessAt || (s.lastFailedAt && s.lastFailedAt > s.lastSuccessAt));
+
+  return (
+    <article className={`flex flex-col rounded-2xl bg-white shadow-sm ring-1 transition ${s.enabled ? "ring-slate-200 hover:ring-indigo-200" : "ring-slate-200 opacity-75"}`}>
+      <div className="flex-1 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="truncate text-sm font-bold text-slate-900">{s.name}</h3>
+            <p className="mt-0.5 text-xs font-medium text-indigo-700">
+              {describeSchedule({ ...s, timezone: zone })} {zoneShort(zone)}
+            </p>
+          </div>
+          <Switch checked={s.enabled} onChange={onToggle} label={s.enabled ? "Pause schedule" : "Turn on schedule"} />
+        </div>
+
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700">{scope}</span>
+          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700">{describeCoverage(s.reportPeriod, coverage)}</span>
+        </div>
+
+        <div className="mt-3 flex items-center gap-1.5 text-xs text-slate-600">
+          <FiMail className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+          <span className="truncate" title={s.recipients.join(", ")}>
+            {s.recipients.slice(0, 2).join(", ")}
+            {s.recipients.length > 2 && <span className="text-slate-400"> +{s.recipients.length - 2} more</span>}
+          </span>
+        </div>
+
+        <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs">
+          {s.enabled && s.nextRunAt ? (
+            <>
+              <div className="flex items-center gap-1.5 font-semibold text-slate-800">
+                <FiClock className="h-3.5 w-3.5 text-indigo-600" />
+                Next: {inZone(s.nextRunAt, zone)} <span className="font-normal text-slate-500">({relative(s.nextRunAt)})</span>
               </div>
-
-              {/* Timing Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                {/* Frequency */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                    Frequency
-                  </label>
-                  <select
-                    value={formData.frequency}
-                    onChange={(e: any) => setFormData((p) => ({ ...p, frequency: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  >
-                    <option value="daily">Daily</option>
-                    <option value="weekly">Weekly (Monday)</option>
-                    <option value="monthly">Monthly (1st)</option>
-                  </select>
+              {windows.length > 0 && (
+                <div className="mt-1 text-slate-500">
+                  Covers {windows.map((w) => `${w.label.toLowerCase()} (${w.rangeLabel})`).join(", ")}
                 </div>
-
-                {/* Time */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                    Time (24h)
-                  </label>
-                  <input
-                    type="time"
-                    value={formData.time}
-                    onChange={(e) => setFormData((p) => ({ ...p, time: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20 font-medium"
-                  />
-                </div>
-
-                {/* Timezone */}
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                    Timezone
-                  </label>
-                  <select
-                    value={formData.timezone}
-                    onChange={(e) => setFormData((p) => ({ ...p, timezone: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  >
-                    {TIMEZONES.map((tz) => (
-                      <option key={tz.value} value={tz.value}>
-                        {tz.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              {/* Scope & Period */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                    Report Scope
-                  </label>
-                  <select
-                    value={formData.reportType}
-                    onChange={(e: any) => setFormData((p) => ({ ...p, reportType: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  >
-                    <option value="expense">All Expense Types (Consolidated)</option>
-                    <option value="combined">Combined (Expense + Credit + Debit)</option>
-                    <option value="office">Office Expenses Only</option>
-                    <option value="travel">Travel Expenses Only</option>
-                    <option value="toPay">Vendor Payments (To Pay) Only</option>
-                    <option value="credit">Credits Only</option>
-                    <option value="debit">Debits Only</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                    Period Bundling
-                  </label>
-                  <select
-                    value={formData.reportPeriod}
-                    onChange={(e: any) => setFormData((p) => ({ ...p, reportPeriod: e.target.value }))}
-                    className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  >
-                    <option value="all">Consolidated (Daily + Weekly + Monthly)</option>
-                    <option value="daily">Daily Period Only</option>
-                    <option value="weekly">Weekly Period Only</option>
-                    <option value="monthly">Monthly Period Only</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Recipient Emails */}
-              <div>
-                <label className="block text-xs font-bold text-slate-700 uppercase tracking-wider mb-1.5">
-                  Email Recipients *
-                </label>
-                <div className="flex gap-2 mb-2">
-                  <input
-                    type="email"
-                    placeholder="e.g. director@company.com"
-                    value={newEmail}
-                    onChange={(e) => setNewEmail(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleAddEmail();
-                      }
-                    }}
-                    className="flex-1 px-3 py-1.5 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-purple-500/20"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleAddEmail}
-                    className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl text-xs font-semibold"
-                  >
-                    Add
-                  </button>
-                </div>
-
-                {/* Email tags */}
-                <div className="flex flex-wrap gap-1.5 p-2 rounded-xl bg-slate-50 border border-slate-200 min-h-[36px]">
-                  {formData.recipients.length === 0 ? (
-                    <span className="text-xs text-slate-400 italic">No recipients added yet</span>
-                  ) : (
-                    formData.recipients.map((email) => (
-                      <span
-                        key={email}
-                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-white text-slate-700 border border-slate-200 shadow-2xs"
-                      >
-                        {email}
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveEmail(email)}
-                          className="text-slate-400 hover:text-red-500"
-                        >
-                          <FiX className="w-3 h-3" />
-                        </button>
-                      </span>
-                    ))
-                  )}
-                </div>
-              </div>
-
-              {/* Advanced Filters Accordion / Box */}
-              <div className="border border-slate-200 rounded-xl p-4 bg-slate-50/50 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-                    <FiFilter className="w-3.5 h-3.5 text-purple-600" />
-                    Advanced Report Filters (Optional)
-                  </h4>
-                  <span className="text-[11px] text-slate-400">Leave unselected to include all</span>
-                </div>
-
-                {/* Expense Sources Filter */}
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
-                    Expense Sources
-                  </label>
-                  <div className="flex gap-2">
-                    {(["office", "travel", "toPay"] as const).map((source) => {
-                      const selected = formData.filters?.expenseSources?.includes(source);
-                      return (
-                        <button
-                          key={source}
-                          type="button"
-                          onClick={() => toggleSourceFilter(source)}
-                          className={`px-3 py-1 text-xs rounded-lg font-medium border capitalize transition-all ${
-                            selected
-                              ? "bg-purple-100 text-purple-800 border-purple-300"
-                              : "bg-white text-slate-600 border-slate-200"
-                          }`}
-                        >
-                          {source === "toPay" ? "To Pay (Vendors)" : source}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Statuses Filter */}
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
-                    Approval Statuses
-                  </label>
-                  <div className="flex gap-2">
-                    {(["approved", "pending", "rejected"] as const).map((status) => {
-                      const selected = formData.filters?.statuses?.includes(status);
-                      return (
-                        <button
-                          key={status}
-                          type="button"
-                          onClick={() => toggleStatusFilter(status)}
-                          className={`px-3 py-1 text-xs rounded-lg font-medium border capitalize transition-all ${
-                            selected
-                              ? "bg-indigo-100 text-indigo-800 border-indigo-300"
-                              : "bg-white text-slate-600 border-slate-200"
-                          }`}
-                        >
-                          {status}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Specific Users Filter */}
-                {usersList.length > 0 && (
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
-                      Specific Users ({formData.filters?.userIds?.length || 0} selected)
-                    </label>
-                    <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto p-2 bg-white rounded-lg border border-slate-200">
-                      {usersList.map((u) => {
-                        const selected = formData.filters?.userIds?.includes(u._id);
-                        return (
-                          <button
-                            key={u._id}
-                            type="button"
-                            onClick={() => toggleUserFilter(u._id)}
-                            className={`px-2.5 py-0.5 rounded text-[11px] font-medium border transition-all ${
-                              selected
-                                ? "bg-purple-600 text-white border-purple-600"
-                                : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                            }`}
-                          >
-                            {u.name}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* Specific Categories Filter */}
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-600 mb-1.5">
-                    Categories ({formData.filters?.categories?.length || 0} selected)
-                  </label>
-                  <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto p-2 bg-white rounded-lg border border-slate-200">
-                    {EXPENSE_CATEGORIES.map((cat) => {
-                      const selected = formData.filters?.categories?.includes(cat);
-                      return (
-                        <button
-                          key={cat}
-                          type="button"
-                          onClick={() => toggleCategoryFilter(cat)}
-                          className={`px-2 py-0.5 rounded text-[10px] capitalize font-medium border transition-all ${
-                            selected
-                              ? "bg-purple-100 text-purple-700 border-purple-300"
-                              : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
-                          }`}
-                        >
-                          {cat}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              {/* Active Toggle */}
-              <div className="flex items-center justify-between pt-2">
-                <span className="text-xs font-semibold text-slate-700">Activate schedule immediately</span>
-                <button
-                  type="button"
-                  onClick={() => setFormData((p) => ({ ...p, enabled: !p.enabled }))}
-                  className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                    formData.enabled ? "bg-purple-600" : "bg-slate-300"
-                  }`}
-                >
-                  <span
-                    className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                      formData.enabled ? "translate-x-5" : "translate-x-0"
-                    }`}
-                  />
-                </button>
-              </div>
+              )}
+            </>
+          ) : (
+            <div className="flex items-center gap-1.5 font-medium text-slate-500">
+              <FiClock className="h-3.5 w-3.5" /> Paused — no emails will be sent
             </div>
-
-            {/* Modal Footer */}
-            <div className="px-6 py-4 border-t border-slate-100 flex items-center justify-end gap-3 bg-slate-50/50">
-              <button
-                type="button"
-                onClick={() => setIsModalOpen(false)}
-                className="px-4 py-2 text-xs font-semibold rounded-xl text-slate-600 hover:bg-slate-100"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSaveModal}
-                disabled={modalSaving}
-                className="px-5 py-2 text-xs font-semibold rounded-xl bg-purple-600 text-white hover:bg-purple-700 shadow-sm shadow-purple-200 transition-all disabled:opacity-50 flex items-center gap-1.5"
-              >
-                {modalSaving ? (
-                  <>
-                    <FiRefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    Saving Schedule...
-                  </>
-                ) : (
-                  <>
-                    <FiCheck className="w-3.5 h-3.5" />
-                    {modalMode === "create" ? "Create Schedule" : "Save Changes"}
-                  </>
-                )}
-              </button>
+          )}
+          {s.lastSuccessAt && !failing && (
+            <div className="mt-1.5 flex items-center gap-1.5 text-slate-600">
+              <FiCheckCircle className="h-3.5 w-3.5 text-green-600" /> Last sent {relative(s.lastSuccessAt)}
             </div>
+          )}
+        </div>
+
+        {failing && (
+          <div className="mt-2 flex gap-1.5 rounded-xl bg-red-50 p-3 text-xs text-red-800 ring-1 ring-red-100">
+            <FiXCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              <strong>Last attempt failed</strong> {relative(s.lastFailedAt)}: {s.lastErrorMessage}
+              {(s.consecutiveFailures || 0) > 0 && " — will retry automatically."}
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between gap-2 border-t border-slate-100 px-3 py-2.5">
+        <button
+          onClick={onSend}
+          disabled={sending}
+          className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50"
+        >
+          {sending ? <FiRefreshCw className="h-3.5 w-3.5 animate-spin" /> : <FiSend className="h-3.5 w-3.5" />}
+          {sending ? "Sending…" : "Send now"}
+        </button>
+        <div className="flex items-center gap-1">
+          <button onClick={onEdit} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-100">
+            <FiEdit2 className="h-3.5 w-3.5" /> Edit
+          </button>
+          <button onClick={onDelete} aria-label="Delete schedule" className="rounded-lg p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600">
+            <FiTrash2 className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function Switch({ checked, onChange, label }: { checked: boolean; onChange: () => void; label: string }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      title={label}
+      onClick={onChange}
+      className={`relative inline-flex h-6 w-11 shrink-0 rounded-full transition ${checked ? "bg-indigo-600" : "bg-slate-300"}`}
+    >
+      <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${checked ? "left-[22px]" : "left-0.5"}`} />
+    </button>
+  );
+}
+
+// ─── History ──────────────────────────────────────────────────────────────────
+
+function HistorySection({ history, total, page, loading, onPage }: {
+  history: Execution[];
+  total: number;
+  page: number;
+  loading: boolean;
+  onPage: (p: number) => void;
+}) {
+  return (
+    <section className="rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
+      <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-4 py-3">
+        <div>
+          <h2 className="text-base font-bold text-slate-900">Delivery history</h2>
+          <p className="text-xs text-slate-500">Every report emailed, with its totals and links</p>
+        </div>
+        <button onClick={() => onPage(page)} disabled={loading} aria-label="Refresh history"
+          className="rounded-xl p-2 text-slate-500 ring-1 ring-slate-200 hover:text-indigo-600">
+          <FiRefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+
+      {history.length === 0 ? (
+        <p className="px-4 py-10 text-center text-sm text-slate-400">{loading ? "Loading…" : "No reports have been sent yet."}</p>
+      ) : (
+        <ul className="divide-y divide-slate-100">
+          {history.map((h) => <HistoryRow key={h._id} item={h} />)}
+        </ul>
+      )}
+
+      {total > 10 && (
+        <div className="flex items-center justify-between border-t border-slate-100 px-4 py-3 text-xs text-slate-500">
+          <span>Page {page} of {Math.ceil(total / 10)}</span>
+          <div className="flex gap-2">
+            <button disabled={page <= 1 || loading} onClick={() => onPage(page - 1)} className="rounded-lg px-3 py-1.5 font-semibold ring-1 ring-slate-200 disabled:opacity-40">Previous</button>
+            <button disabled={page * 10 >= total || loading} onClick={() => onPage(page + 1)} className="rounded-lg px-3 py-1.5 font-semibold ring-1 ring-slate-200 disabled:opacity-40">Next</button>
           </div>
         </div>
       )}
     </section>
+  );
+}
+
+function HistoryRow({ item: h }: { item: Execution }) {
+  const [copied, setCopied] = useState(false);
+  const expired = !!h.shareExpiresAt && new Date(h.shareExpiresAt) < new Date();
+  const ok = h.status === "success";
+  const sections = h.sections?.length
+    ? h.sections
+    : ok ? [{ key: h.period, label: labelize(h.period), from: h.fromDate, to: h.toDate, total: h.totalAmount, count: h.recordCount }] : [];
+
+  const copy = async () => {
+    if (!h.shareUrl) return;
+    await navigator.clipboard.writeText(h.shareUrl).catch(() => {});
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <li className="flex flex-col gap-2 px-4 py-3 md:flex-row md:items-center md:gap-4">
+      <div className="flex min-w-0 items-start gap-3 md:w-64 md:shrink-0">
+        <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${ok ? "bg-green-50 text-green-700" : "bg-red-50 text-red-600"}`}>
+          {ok ? <FiCheck className="h-4 w-4" /> : <FiXCircle className="h-4 w-4" />}
+        </div>
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-900">
+            {DateTime.fromISO(h.executedAt).toFormat("d LLL yyyy, h:mm a")}
+          </div>
+          <div className="text-xs text-slate-500">
+            {TRIGGER_LABEL[h.triggeredBy] || h.triggeredBy} · {h.recipients?.length || 0} recipient{h.recipients?.length === 1 ? "" : "s"}
+          </div>
+        </div>
+      </div>
+
+      <div className="min-w-0 flex-1 text-xs">
+        {ok ? (
+          <div className="flex flex-wrap gap-1.5">
+            {sections.map((s) => (
+              <span key={s.key + s.from} className="rounded-lg bg-slate-50 px-2 py-1 text-slate-700 ring-1 ring-slate-100">
+                <span className="font-semibold">{s.label}</span> {fmtINR(s.total)} <span className="text-slate-400">· {s.count}</span>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="text-red-700">{h.errorMessage || "Failed"}</p>
+        )}
+      </div>
+
+      {ok && (
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+          {h.shareUrl && !expired ? (
+            <>
+              <a href={h.shareUrl} target="_blank" rel="noreferrer"
+                className="inline-flex items-center gap-1 rounded-lg bg-indigo-50 px-2.5 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-indigo-100">
+                <FiExternalLink className="h-3.5 w-3.5" /> Open
+              </a>
+              <button onClick={copy} className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50">
+                {copied ? <FiCheck className="h-3.5 w-3.5 text-green-600" /> : <FiCopy className="h-3.5 w-3.5" />} {copied ? "Copied" : "Link"}
+              </button>
+            </>
+          ) : h.shareUrl ? (
+            <span className="text-xs text-slate-400">Link expired</span>
+          ) : null}
+          {h.pdfUrls?.[0] && (
+            <a href={h.pdfUrls[0]} target="_blank" rel="noreferrer"
+              className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-600 ring-1 ring-slate-200 hover:bg-slate-50">
+              <FiFileText className="h-3.5 w-3.5" /> PDF
+            </a>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+// ─── Editor ───────────────────────────────────────────────────────────────────
+
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="mb-1.5 text-xs font-semibold text-slate-700">{label}</div>
+      {children}
+      {hint && <p className="mt-1 text-[11px] text-slate-500">{hint}</p>}
+    </div>
+  );
+}
+
+function Segmented<T extends string | number>({ value, options, onChange }: {
+  value: T;
+  options: { value: T; label: string; hint?: string }[];
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className={`grid gap-1 rounded-xl bg-slate-100 p-1`} style={{ gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))` }}>
+      {options.map((o) => (
+        <button
+          key={String(o.value)}
+          type="button"
+          onClick={() => onChange(o.value)}
+          aria-pressed={value === o.value}
+          className={`rounded-lg px-2 py-2 text-center text-xs font-semibold transition sm:text-sm ${value === o.value ? "bg-white text-indigo-700 shadow-sm" : "text-slate-600 hover:text-slate-900"}`}
+        >
+          {o.label}
+          {o.hint && <span className="block text-[10px] font-normal text-slate-500">{o.hint}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ChipToggle({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`rounded-full px-3 py-1.5 text-xs font-semibold ring-1 transition ${active ? "bg-indigo-600 text-white ring-indigo-600" : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50"}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function toggleIn<T>(list: T[] | undefined, v: T): T[] {
+  const l = list || [];
+  return l.includes(v) ? l.filter((x) => x !== v) : [...l, v];
+}
+
+function ScheduleEditor({ mode, initial, users, onClose, onSaved, onTestSent }: {
+  mode: "create" | "edit";
+  initial: Schedule;
+  users: UserItem[];
+  onClose: () => void;
+  onSaved: () => void;
+  onTestSent: () => void;
+}) {
+  const [form, setForm] = useState<Schedule>({
+    ...initial,
+    dayOfWeek: initial.dayOfWeek || 1,
+    dayOfMonth: initial.dayOfMonth || 1,
+    coverage: initial.coverage || "previous",
+    linkTtlHours: initial.linkTtlHours || 168,
+    attachFiles: initial.attachFiles !== false,
+    filters: { userIds: [], expenseSources: [], categories: [], statuses: [], ...initial.filters },
+  });
+  const [emailInput, setEmailInput] = useState("");
+  const [testEmail, setTestEmail] = useState(initial.recipients[0] || "");
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [showFilters, setShowFilters] = useState(
+    !!(initial.filters?.userIds?.length || initial.filters?.categories?.length || initial.filters?.expenseSources?.length)
+  );
+  const [userQuery, setUserQuery] = useState("");
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const set = <K extends keyof Schedule>(key: K, value: Schedule[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const setFilter = <K extends keyof ScheduleFilters>(key: K, value: ScheduleFilters[K]) =>
+    setForm((f) => ({ ...f, filters: { ...f.filters, [key]: value } }));
+
+  const preview = useMemo(() => {
+    const timing = { frequency: form.frequency, time: form.time, timezone: form.timezone, dayOfWeek: form.dayOfWeek, dayOfMonth: form.dayOfMonth };
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(form.time)) return null;
+    const next = computeNextRun(timing);
+    return {
+      when: DateTime.fromJSDate(next).setZone(form.timezone).toFormat("cccc, d LLLL yyyy 'at' h:mm a"),
+      rel: DateTime.fromJSDate(next).toRelative(),
+      windows: getReportWindows(form.reportPeriod, form.coverage || "current", next, form.timezone),
+      describe: describeSchedule(timing),
+    };
+  }, [form.frequency, form.time, form.timezone, form.dayOfWeek, form.dayOfMonth, form.reportPeriod, form.coverage]);
+
+  const addEmails = (raw: string) => {
+    const parts = raw.split(/[\s,;]+/).map((p) => p.trim().toLowerCase()).filter(Boolean);
+    if (parts.length === 0) return;
+    const bad = parts.filter((p) => !EMAIL_RE.test(p));
+    const good = parts.filter((p) => EMAIL_RE.test(p) && !form.recipients.includes(p));
+    if (good.length) set("recipients", [...form.recipients, ...good]);
+    if (!testEmail && good[0]) setTestEmail(good[0]);
+    if (bad.length) {
+      toast.error(`Not a valid email: ${bad.join(", ")}`);
+      setEmailInput(bad.join(", "));
+    } else {
+      setEmailInput("");
+    }
+  };
+
+  const payload = () => {
+    const pending = emailInput.trim();
+    const recipients = [...form.recipients];
+    if (pending && EMAIL_RE.test(pending.toLowerCase()) && !recipients.includes(pending.toLowerCase())) recipients.push(pending.toLowerCase());
+    return { ...form, recipients };
+  };
+
+  const save = async () => {
+    const body = payload();
+    if (!body.name.trim()) return toast.error("Give the schedule a name");
+    if (body.recipients.length === 0) return toast.error("Add at least one recipient email");
+    setSaving(true);
+    try {
+      const res = await fetch("/api/settings/scheduled-reports", {
+        method: mode === "create" ? "POST" : "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      if (json.type !== "SUCCESS") throw new Error(json.message);
+      toast.success(mode === "create" ? "Schedule created" : "Schedule saved");
+      onSaved();
+    } catch (err) {
+      toast.error((err as Error).message || "Could not save the schedule");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const sendTest = async () => {
+    const to = testEmail.trim().toLowerCase();
+    if (!EMAIL_RE.test(to)) return toast.error("Enter a valid email for the test");
+    setTesting(true);
+    try {
+      const res = await fetch("/api/settings/scheduled-reports/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft: payload(), recipients: [to] }),
+      });
+      const json = await res.json();
+      if (json.type !== "SUCCESS") throw new Error(json.message);
+      toast.success(`Test report sent to ${to}`);
+      onTestSent();
+    } catch (err) {
+      toast.error((err as Error).message || "Test email failed");
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const filteredUsers = users.filter((u) => u.name?.toLowerCase().includes(userQuery.toLowerCase()));
+  const statuses = form.filters?.statuses || [];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={mode === "create" ? "New report schedule" : "Edit report schedule"}
+        onClick={(e) => e.stopPropagation()}
+        className="flex max-h-[94vh] w-full flex-col rounded-t-3xl bg-white shadow-2xl sm:max-w-2xl sm:rounded-3xl"
+      >
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+          <div>
+            <h3 className="text-base font-bold text-slate-900">{mode === "create" ? "New report schedule" : "Edit schedule"}</h3>
+            <p className="text-xs text-slate-500">Who gets the report, when, and what it covers</p>
+          </div>
+          <button onClick={onClose} aria-label="Close" className="rounded-full p-1.5 text-slate-500 hover:bg-slate-100">
+            <FiX className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 space-y-6 overflow-y-auto px-5 py-5">
+          <Field label="Name">
+            <input
+              value={form.name}
+              onChange={(e) => set("name", e.target.value)}
+              placeholder="e.g. Daily Cash Expense Report"
+              className="w-full rounded-xl border border-slate-200 px-3.5 py-2.5 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+            />
+          </Field>
+
+          {/* Recipients */}
+          <Field label="Send to" hint="Type or paste emails — separate several with commas. Press Enter to add.">
+            <div className="flex min-h-[46px] flex-wrap items-center gap-1.5 rounded-xl border border-slate-200 px-2 py-1.5 focus-within:border-indigo-400 focus-within:ring-2 focus-within:ring-indigo-100">
+              {form.recipients.map((email) => (
+                <span key={email} className="inline-flex items-center gap-1 rounded-full bg-indigo-50 py-1 pl-2.5 pr-1.5 text-xs font-medium text-indigo-800">
+                  {email}
+                  <button type="button" aria-label={`Remove ${email}`} onClick={() => set("recipients", form.recipients.filter((e) => e !== email))}
+                    className="rounded-full p-0.5 hover:bg-indigo-100">
+                    <FiX className="h-3 w-3" />
+                  </button>
+                </span>
+              ))}
+              <input
+                type="email"
+                inputMode="email"
+                value={emailInput}
+                onChange={(e) => setEmailInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (["Enter", ",", " ", "Tab"].includes(e.key) && emailInput.trim()) {
+                    e.preventDefault();
+                    addEmails(emailInput);
+                  } else if (e.key === "Backspace" && !emailInput && form.recipients.length) {
+                    set("recipients", form.recipients.slice(0, -1));
+                  }
+                }}
+                onPaste={(e) => {
+                  const text = e.clipboardData.getData("text");
+                  if (/[,;\s]/.test(text.trim())) {
+                    e.preventDefault();
+                    addEmails(text);
+                  }
+                }}
+                onBlur={() => emailInput.trim() && addEmails(emailInput)}
+                placeholder={form.recipients.length ? "Add another…" : "name@company.com"}
+                className="min-w-[160px] flex-1 bg-transparent px-1 py-1 text-sm outline-none"
+              />
+            </div>
+          </Field>
+
+          {/* When */}
+          <div className="space-y-3">
+            <div className="text-sm font-bold text-slate-900">When</div>
+            <Segmented
+              value={form.frequency}
+              onChange={(v) => setForm((f) => ({ ...f, frequency: v, reportPeriod: f.reportPeriod === "all" ? "all" : v }))}
+              options={[
+                { value: "daily", label: "Daily" },
+                { value: "weekly", label: "Weekly" },
+                { value: "monthly", label: "Monthly" },
+              ]}
+            />
+            {form.frequency === "weekly" && (
+              <div className="flex flex-wrap gap-1.5">
+                {WEEKDAYS.map((d) => (
+                  <ChipToggle key={d.value} active={form.dayOfWeek === d.value} onClick={() => set("dayOfWeek", d.value)}>
+                    {d.label.slice(0, 3)}
+                  </ChipToggle>
+                ))}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              {form.frequency === "monthly" && (
+                <Field label="Day of month">
+                  <select value={form.dayOfMonth} onChange={(e) => set("dayOfMonth", Number(e.target.value))}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm">
+                    {Array.from({ length: 28 }, (_, i) => i + 1).map((d) => <option key={d} value={d}>{d}</option>)}
+                    <option value={31}>Last day</option>
+                  </select>
+                </Field>
+              )}
+              <Field label="Time">
+                <input type="time" value={form.time} onChange={(e) => set("time", e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
+              </Field>
+              <Field label="Time zone">
+                <select value={form.timezone} onChange={(e) => set("timezone", e.target.value)}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm">
+                  {TIMEZONES.map((tz) => <option key={tz.value} value={tz.value}>{tz.label}</option>)}
+                </select>
+              </Field>
+            </div>
+          </div>
+
+          {/* What */}
+          <div className="space-y-3">
+            <div className="text-sm font-bold text-slate-900">What the email contains</div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {CONTENT_OPTIONS.map((o) => (
+                <button key={o.value} type="button" onClick={() => set("reportPeriod", o.value)} aria-pressed={form.reportPeriod === o.value}
+                  className={`rounded-xl p-3 text-left ring-1 transition ${form.reportPeriod === o.value ? "bg-indigo-50 ring-2 ring-indigo-500" : "ring-slate-200 hover:bg-slate-50"}`}>
+                  <div className="text-xs font-bold text-slate-900">{o.label}</div>
+                  <div className="mt-0.5 text-[11px] text-slate-500">{o.hint}</div>
+                </button>
+              ))}
+            </div>
+            <Field label="Which period">
+              <Segmented
+                value={form.coverage || "current"}
+                onChange={(v) => set("coverage", v)}
+                options={[
+                  { value: "current", label: "Up to send time", hint: form.reportPeriod === "weekly" ? "This week so far" : form.reportPeriod === "monthly" ? "This month so far" : "Today so far" },
+                  { value: "previous", label: "Last complete period", hint: form.reportPeriod === "weekly" ? "Last week" : form.reportPeriod === "monthly" ? "Last month" : "Yesterday" },
+                ]}
+              />
+            </Field>
+            <Field label="Data">
+              <select value={form.reportType} onChange={(e) => set("reportType", e.target.value as ReportType)}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm">
+                {SCOPES.map((s) => <option key={s.value} value={s.value}>{s.label} — {s.hint}</option>)}
+              </select>
+            </Field>
+            <Field label="Include claims that are">
+              <div className="flex flex-wrap gap-1.5">
+                {(["approved", "pending", "rejected"] as const).map((st) => (
+                  <ChipToggle key={st} active={statuses.length === 0 || statuses.includes(st)}
+                    onClick={() => setFilter("statuses", toggleIn(statuses.length === 0 ? ["approved", "pending", "rejected"] : statuses, st) as ScheduleFilters["statuses"])}>
+                    {labelize(st)}
+                  </ChipToggle>
+                ))}
+              </div>
+              <p className="mt-1 text-[11px] text-slate-500">Rejected claims are always shown separately and never added to the total.</p>
+            </Field>
+          </div>
+
+          {/* Advanced filters */}
+          <div className="rounded-2xl ring-1 ring-slate-200">
+            <button type="button" onClick={() => setShowFilters((s) => !s)} className="flex w-full items-center justify-between px-4 py-3 text-left">
+              <span className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+                <FiFilter className="h-4 w-4 text-indigo-600" /> Only include some employees or categories
+              </span>
+              <FiChevronDown className={`h-4 w-4 text-slate-500 transition ${showFilters ? "rotate-180" : ""}`} />
+            </button>
+            {showFilters && (
+              <div className="space-y-4 border-t border-slate-100 px-4 py-4">
+                {["expense", "combined"].includes(form.reportType) && (
+                  <Field label="Expense types" hint="None selected = all">
+                    <div className="flex flex-wrap gap-1.5">
+                      {(["office", "travel", "toPay"] as const).map((src) => (
+                        <ChipToggle key={src} active={!!form.filters?.expenseSources?.includes(src)}
+                          onClick={() => setFilter("expenseSources", toggleIn(form.filters?.expenseSources, src))}>
+                          {labelize(src)}
+                        </ChipToggle>
+                      ))}
+                    </div>
+                  </Field>
+                )}
+                <Field label={`Employees (${form.filters?.userIds?.length || 0} selected)`} hint="None selected = everyone">
+                  {users.length > 8 && (
+                    <input value={userQuery} onChange={(e) => setUserQuery(e.target.value)} placeholder="Search employees…"
+                      className="mb-2 w-full rounded-xl border border-slate-200 px-3 py-2 text-sm" />
+                  )}
+                  <div className="flex max-h-36 flex-wrap gap-1.5 overflow-y-auto">
+                    {filteredUsers.map((u) => (
+                      <ChipToggle key={u._id} active={!!form.filters?.userIds?.includes(u._id)}
+                        onClick={() => setFilter("userIds", toggleIn(form.filters?.userIds, u._id))}>
+                        {u.name}
+                      </ChipToggle>
+                    ))}
+                    {users.length === 0 && <span className="text-xs text-slate-400">Employee list unavailable</span>}
+                  </div>
+                </Field>
+                <Field label={`Categories (${form.filters?.categories?.length || 0} selected)`} hint="None selected = all categories">
+                  <div className="flex flex-wrap gap-1.5">
+                    {CATEGORIES.map((c) => (
+                      <ChipToggle key={c} active={!!form.filters?.categories?.includes(c)}
+                        onClick={() => setFilter("categories", toggleIn(form.filters?.categories, c))}>
+                        {labelize(c)}
+                      </ChipToggle>
+                    ))}
+                  </div>
+                </Field>
+              </div>
+            )}
+          </div>
+
+          {/* Delivery options */}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="Report link works for" hint="After this the emailed link and download buttons stop working">
+              <select value={form.linkTtlHours} onChange={(e) => set("linkTtlHours", Number(e.target.value))}
+                className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm">
+                {LINK_TTLS.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+              </select>
+            </Field>
+            <div className="space-y-3 pt-1">
+              <label className="flex items-center justify-between gap-3 text-sm text-slate-700">
+                <span>Attach PDF &amp; Excel files</span>
+                <Switch checked={form.attachFiles !== false} onChange={() => set("attachFiles", !(form.attachFiles !== false))} label="Attach files" />
+              </label>
+              <label className="flex items-center justify-between gap-3 text-sm text-slate-700">
+                <span>Schedule is active</span>
+                <Switch checked={form.enabled} onChange={() => set("enabled", !form.enabled)} label="Active" />
+              </label>
+            </div>
+          </div>
+
+          {/* Live preview */}
+          {preview && (
+            <div className="rounded-2xl bg-indigo-50 p-4 ring-1 ring-indigo-100">
+              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-indigo-700">
+                <FiCalendar className="h-4 w-4" /> {form.enabled ? "Next email" : "Next email (when turned on)"}
+              </div>
+              <p className="mt-1 text-sm font-semibold text-slate-900">
+                {preview.when} <span className="font-normal text-slate-500">({preview.rel})</span>
+              </p>
+              <ul className="mt-2 space-y-1 text-xs text-slate-700">
+                {preview.windows.map((w) => (
+                  <li key={w.key} className="flex items-center gap-1.5">
+                    <FiCheck className="h-3.5 w-3.5 text-indigo-600" />
+                    <strong>{w.label}</strong> — {w.rangeLabel}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2 text-[11px] text-slate-500">
+                Then {preview.describe.charAt(0).toLowerCase() + preview.describe.slice(1)} to {form.recipients.length || "no"} recipient{form.recipients.length === 1 ? "" : "s"}.
+              </p>
+            </div>
+          )}
+
+          {/* Test */}
+          <div className="rounded-2xl bg-slate-50 p-4">
+            <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
+              <FiUsers className="h-4 w-4 text-slate-500" /> Try it first
+            </div>
+            <p className="mt-0.5 text-xs text-slate-500">Send this report (as configured above) to one address, without saving.</p>
+            <div className="mt-2 flex gap-2">
+              <input type="email" value={testEmail} onChange={(e) => setTestEmail(e.target.value)} placeholder="you@company.com"
+                className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm" />
+              <button type="button" onClick={sendTest} disabled={testing}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-white px-3.5 py-2 text-sm font-semibold text-indigo-700 ring-1 ring-indigo-200 hover:bg-indigo-50 disabled:opacity-50">
+                {testing ? <FiRefreshCw className="h-4 w-4 animate-spin" /> : <FiSend className="h-4 w-4" />}
+                {testing ? "Sending…" : "Send test"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex gap-2 border-t border-slate-100 px-5 py-3 pb-[max(env(safe-area-inset-bottom),12px)]">
+          <button onClick={onClose} className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-200 sm:flex-none sm:px-6">
+            Cancel
+          </button>
+          <button onClick={save} disabled={saving}
+            className="inline-flex flex-[2] items-center justify-center gap-1.5 rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50 sm:ml-auto sm:flex-none sm:px-6">
+            {saving ? <FiRefreshCw className="h-4 w-4 animate-spin" /> : <FiCheck className="h-4 w-4" />}
+            {mode === "create" ? "Create schedule" : "Save changes"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

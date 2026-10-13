@@ -17,14 +17,25 @@ export interface IScheduledReport extends Document {
   frequency: "daily" | "weekly" | "monthly";
   time: string; // "HH:mm" (24h)
   timezone: string;
+  dayOfWeek: number;   // weekly: 1 = Monday … 7 = Sunday
+  dayOfMonth: number;  // monthly: 1–31 (31 = last day of month)
   recipients: string[];
   reportPeriod: "daily" | "weekly" | "monthly" | "all";
+  /** "current" = period in progress at send time, "previous" = last completed period */
+  coverage: "current" | "previous";
+  /** How long the emailed share link / download buttons stay valid. */
+  linkTtlHours: number;
+  /** Attach the PDF + Excel files to the email. */
+  attachFiles: boolean;
   enabled: boolean;
   filters: IScheduledReportFilters;
   lastRunAt?: Date | null;
   lastSuccessAt?: Date | null;
+  lastSuccessSlotAt?: Date | null;
   lastFailedAt?: Date | null;
   lastErrorMessage?: string | null;
+  consecutiveFailures: number;
+  lockedUntil?: Date | null;
   nextRunAt?: Date | null;
   createdBy?: mongoose.Types.ObjectId;
   updatedBy?: mongoose.Types.ObjectId;
@@ -62,6 +73,12 @@ const scheduledReportSchema = new Schema<IScheduledReport>(
       default: "Asia/Kolkata",
       required: true,
     },
+    dayOfWeek: { type: Number, default: 1, min: 1, max: 7 },
+    dayOfMonth: { type: Number, default: 1, min: 1, max: 31 },
+    // Existing schedules keep the original "previous period" behaviour.
+    coverage: { type: String, enum: ["current", "previous"], default: "previous" },
+    linkTtlHours: { type: Number, default: 168, min: 1, max: 24 * 31 },
+    attachFiles: { type: Boolean, default: true },
     recipients: {
       type: [String],
       required: true,
@@ -114,8 +131,11 @@ const scheduledReportSchema = new Schema<IScheduledReport>(
     },
     lastRunAt: { type: Date, default: null },
     lastSuccessAt: { type: Date, default: null },
+    lastSuccessSlotAt: { type: Date, default: null },
     lastFailedAt: { type: Date, default: null },
     lastErrorMessage: { type: String, default: null },
+    consecutiveFailures: { type: Number, default: 0 },
+    lockedUntil: { type: Date, default: null },
     nextRunAt: { type: Date, default: null, index: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "Users" },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Users" },

@@ -3,106 +3,128 @@
 /**
  * /app/shared-report/[token]/page.tsx
  *
- * Public read-only report viewer — No CashWise login required.
- * Validates the 24-hour secure share token via /api/reports/share/[token].
- * Displays full interactive financial dashboard from the report snapshot.
+ * Public, read-only report viewer — no CashWise login required.
+ * The token is validated server-side by /api/reports/share/[token]; this page
+ * renders the immutable snapshot that was emailed.
+ *
+ * All totals are recomputed in the browser with the same functions that
+ * produced the email/PDF/Excel (app/_lib/reportDigest), so they always agree
+ * and update live as the viewer filters.
  */
 
-import React, { useEffect, useState, useMemo, useCallback } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
-import jsPDF from "jspdf";
-import autoTable from "jspdf-autotable";
+import {
+  FiAlertTriangle,
+  FiCheck,
+  FiCheckCircle,
+  FiClock,
+  FiCopy,
+  FiDownload,
+  FiExternalLink,
+  FiFileText,
+  FiFilter,
+  FiGrid,
+  FiLink,
+  FiLock,
+  FiMail,
+  FiPaperclip,
+  FiRefreshCw,
+  FiSearch,
+  FiShare2,
+  FiX,
+  FiXCircle,
+} from "react-icons/fi";
+import {
+  filterRows,
+  fmtINR,
+  fmtCompactINR,
+  hasActiveFilters,
+  labelize,
+  legacySection,
+  pct,
+  rowFiltersToQuery,
+  summarizeRows,
+  type Bucket,
+  type CashPosition,
+  type ReportRow,
+  type ReportSection,
+  type RowFilters,
+} from "@app/_lib/reportDigest";
 
-// ─── Interfaces ───────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-interface SnapshotRow {
-  _id: string;
-  date: string;
-  type: "expense" | "credit" | "debit";
-  source: string;
-  userName: string;
-  userId: string;
-  category: string;
-  siteName: string;
-  amount: number;
-  description: string;
-  remarks: string;
-  status: string;
-  attachments: string[];
-  createdAt: string;
-  [key: string]: unknown;
-}
-
-interface SnapshotSummary {
-  expenseTotal: number;
-  creditTotal: number;
-  debitTotal: number;
-  grandTotal: number;
-  netCreditDebit: number;
-  totalRecords: number;
-  averagePerEntry: number;
-  byUser: Record<string, { total: number; count: number }>;
-  byDate: Record<string, { total: number; count: number }>;
-  byCategory: Record<string, { total: number; count: number }>;
-}
-
-interface SnapshotData {
+interface Snapshot {
+  version?: number;
   reportType: string;
   fromDate: string;
   toDate: string;
   period: string;
-  recordCount: number;
-  totalAmount: number;
-  filters: Record<string, unknown>;
-  summary: SnapshotSummary;
-  rows: SnapshotRow[];
   scheduleName?: string;
+  scheduleDescription?: string;
+  generatedAt?: string;
   timezone?: string;
-  recipients?: string[];
+  sections?: Omit<ReportSection, "rows">[];
+  rows: ReportRow[];
 }
 
 type PageState = "loading" | "expired" | "revoked" | "not_found" | "error" | "ready";
+type SortKey = "newest" | "oldest" | "amount";
+
+// ─── Palette (status colours are reserved for status only) ───────────────────
+
+const STATUS = {
+  approved: { label: "Approved", color: "#0ca30c", Icon: FiCheckCircle, pill: "bg-green-50 text-green-800 ring-green-200" },
+  pending: { label: "Pending", color: "#fab219", Icon: FiClock, pill: "bg-amber-50 text-amber-800 ring-amber-200" },
+  rejected: { label: "Rejected", color: "#d03b3b", Icon: FiXCircle, pill: "bg-red-50 text-red-700 ring-red-200" },
+} as const;
+const BAR = "#2a78d6"; // single-series magnitude hue
+
+const TYPE_LABEL: Record<string, string> = {
+  expense: "Expenses",
+  combined: "Cash & Expenses",
+  credit: "Cash Received",
+  debit: "Cash Spent",
+};
+
+const PAGE_SIZE = 30;
+const EMPTY_FILTERS: RowFilters = { search: "", type: "all", source: "all", statuses: [], users: [], categories: [] };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function fmtINR(val: number | null | undefined): string {
-  const n = Number(val ?? 0);
-  return "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function fmtDay(date: string): string {
+  const d = new Date(`${date}T00:00:00`);
+  return isNaN(d.getTime()) ? date : d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 }
 
-function fmtDate(dateStr: string): string {
-  if (!dateStr) return "—";
-  try {
-    const d = new Date(dateStr);
-    return isNaN(d.getTime())
-      ? dateStr
-      : d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
-  } catch {
-    return dateStr;
+function shortDay(date: string): string {
+  const d = new Date(`${date}T00:00:00`);
+  return isNaN(d.getTime()) ? date : d.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+}
+
+function statusOf(row: ReportRow): keyof typeof STATUS | null {
+  if (row.type !== "expense") return null;
+  const s = String(row.status || "pending").toLowerCase();
+  return s === "approved" || s === "rejected" ? s : "pending";
+}
+
+function toggle(list: string[] | undefined, value: string): string[] {
+  const l = list || [];
+  return l.includes(value) ? l.filter((v) => v !== value) : [...l, value];
+}
+
+function daysBetween(from: string, to: string): string[] {
+  const out: string[] = [];
+  const start = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  if (isNaN(start.getTime()) || isNaN(end.getTime())) return out;
+  for (let d = start; d <= end && out.length < 62; d = new Date(d.getTime() + 86400000)) {
+    out.push(d.toISOString().slice(0, 10));
   }
+  return out;
 }
 
-function calcPct(num: number, denom: number): string {
-  if (!denom || denom === 0) return "0.0%";
-  return ((num / denom) * 100).toFixed(1) + "%";
-}
-
-const TYPE_THEMES: Record<string, { primary: string; light: string; border: string }> = {
-  expense: { primary: "#4f46e5", light: "#eef2ff", border: "#c7d2fe" },
-  credit: { primary: "#16a34a", light: "#f0fdf4", border: "#bbf7d0" },
-  debit: { primary: "#dc2626", light: "#fef2f2", border: "#fecaca" },
-  combined: { primary: "#0891b2", light: "#ecfeff", border: "#a5f3fc" },
-  all: { primary: "#4f46e5", light: "#eef2ff", border: "#c7d2fe" },
-};
-
-const STATUS_BADGES: Record<string, { bg: string; text: string; border: string }> = {
-  approved: { bg: "#dcfce7", text: "#15803d", border: "#86efac" },
-  pending: { bg: "#fef9c3", text: "#854d0e", border: "#fde047" },
-  rejected: { bg: "#fee2e2", text: "#b91c1c", border: "#fca5a5" },
-  default: { bg: "#f1f5f9", text: "#475569", border: "#cbd5e1" },
-};
-
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function SharedReportPage() {
   const params = useParams();
@@ -110,44 +132,27 @@ export default function SharedReportPage() {
 
   const [state, setState] = useState<PageState>("loading");
   const [errorMsg, setErrorMsg] = useState("");
-  const [snapshot, setSnapshot] = useState<SnapshotData | null>(null);
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [expiresAt, setExpiresAt] = useState<string | null>(null);
   const [createdAt, setCreatedAt] = useState<string | null>(null);
 
-  // Filters & Tabs
-  const [activeTab, setActiveTab] = useState<"table" | "user" | "date" | "category">("table");
-  const [search, setSearch] = useState("");
-  const [statusFilters, setStatusFilters] = useState<string[]>([]);
-  const [userFilters, setUserFilters] = useState<string[]>([]);
-  const [categoryFilters, setCategoryFilters] = useState<string[] | null>(null);
-  const [typeFilter, setTypeFilter] = useState("all");
-  const [sourceFilter, setSourceFilter] = useState("all");
-  const [fromDateFilter, setFromDateFilter] = useState("");
-  const [toDateFilter, setToDateFilter] = useState("");
-  const [visibleFields, setVisibleFields] = useState<string[]>([
-    "date", "user", "type", "source", "category", "site", "amount", "status", "description", "attachments",
-  ]);
-  const [currentPage, setCurrentPage] = useState(1);
-  const pageSize = 50;
-
-  // Modals & Share
-  const [copied, setCopied] = useState(false);
-  const [previewImage, setPreviewImage] = useState<string | null>(null);
-
-  // ─── Load Report Snapshot ───────────────────────────────────────────────────
+  const [activeKey, setActiveKey] = useState<string>("");
+  const [filters, setFilters] = useState<RowFilters>(EMPTY_FILTERS);
+  const [sort, setSort] = useState<SortKey>("newest");
+  const [visible, setVisible] = useState(PAGE_SIZE);
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [preview, setPreview] = useState<string | null>(null);
 
   const loadReport = useCallback(async () => {
     if (!token) {
-      setState("error");
-      setErrorMsg("No report token provided.");
+      setState("not_found");
       return;
     }
-
     try {
       setState("loading");
-      const res = await fetch(`/api/reports/share/${token}`);
+      const res = await fetch(`/api/reports/share/${token}`, { cache: "no-store" });
       const json = await res.json();
-
       if (json.type === "SUCCESS" && json.data?.snapshot) {
         setSnapshot(json.data.snapshot);
         setExpiresAt(json.data.expiresAt || null);
@@ -158,15 +163,15 @@ export default function SharedReportPage() {
         setState("expired");
       } else if (json.type === "REVOKED") {
         setState("revoked");
-      } else if (json.type === "NOT_FOUND" || res.status === 404) {
+      } else if (json.type === "NOT_FOUND" || json.type === "INVALID_TOKEN" || res.status === 404) {
         setState("not_found");
       } else {
+        setErrorMsg(json.message || "Failed to load the report.");
         setState("error");
-        setErrorMsg(json.message || "Failed to load report data.");
       }
     } catch {
+      setErrorMsg("Could not reach CashWise. Check your connection and try again.");
       setState("error");
-      setErrorMsg("Network error connecting to CashWise server.");
     }
   }, [token]);
 
@@ -174,1273 +179,925 @@ export default function SharedReportPage() {
     loadReport();
   }, [loadReport]);
 
-  // ─── Filtered Data ──────────────────────────────────────────────────────────
+  // ── Sections (v2 snapshots carry several; legacy ones become one) ──
+  const sections: ReportSection[] = useMemo(() => {
+    if (!snapshot) return [];
+    const rows = Array.isArray(snapshot.rows) ? snapshot.rows : [];
+    if (snapshot.sections?.length) {
+      return snapshot.sections.map((s) => ({ ...s, rows: rows.filter((r) => r.date >= s.from && r.date <= s.to) }));
+    }
+    return [legacySection(snapshot)];
+  }, [snapshot]);
 
-  const rows = useMemo(() => snapshot?.rows || [], [snapshot]);
+  useEffect(() => {
+    if (sections.length && !sections.some((s) => s.key === activeKey)) setActiveKey(sections[0].key);
+  }, [sections, activeKey]);
 
-  const uniqueUsers = useMemo(() => {
-    const set = new Set<string>();
-    rows.forEach((r) => {
-      if (r.userName) set.add(r.userName);
-    });
-    return Array.from(set).sort();
-  }, [rows]);
+  const section = sections.find((s) => s.key === activeKey) || sections[0];
+  const filtered = useMemo(() => (section ? filterRows(section.rows, filters) : []), [section, filters]);
+  const digest = useMemo(() => summarizeRows(filtered), [filtered]);
+  const filtersActive = hasActiveFilters(filters);
+  const cashPosition: CashPosition | null | undefined = filtersActive ? null : section?.cashPosition;
 
-  const uniqueCategories = useMemo(() => {
-    const set = new Set<string>();
-    rows.forEach((r) => {
-      if (r.category) set.add(r.category);
-    });
-    return Array.from(set).sort();
-  }, [rows]);
+  const sorted = useMemo(() => {
+    const list = [...filtered];
+    const key = (r: ReportRow) => `${r.date || ""}|${r.createdAt || ""}`;
+    if (sort === "amount") list.sort((a, b) => (Number(b.amount) || 0) - (Number(a.amount) || 0));
+    else if (sort === "oldest") list.sort((a, b) => key(a).localeCompare(key(b)));
+    else list.sort((a, b) => key(b).localeCompare(key(a)));
+    return list;
+  }, [filtered, sort]);
 
-  const uniqueSources = useMemo(() => {
-    return Array.from(new Set(rows.map((r) => r.source).filter(Boolean))).sort();
-  }, [rows]);
+  useEffect(() => setVisible(PAGE_SIZE), [filters, activeKey, sort]);
 
-  // Progressive faceting: global filters → users → categories → dates/table.
-  // Keeping each stage separate lets users select more than one card without
-  // making the remaining user/category cards disappear.
-  const globallyFilteredRows = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return rows.filter((r) => {
-      if (statusFilters.length > 0 && !statusFilters.includes(r.status?.toLowerCase())) return false;
-      if (typeFilter !== "all" && r.type !== typeFilter) return false;
-      if (sourceFilter !== "all" && r.source !== sourceFilter) return false;
-      if (fromDateFilter && r.date < fromDateFilter) return false;
-      if (toDateFilter && r.date > toDateFilter) return false;
-
-      if (q) {
-        const text = `${r.userName} ${r.siteName} ${r.category} ${r.description} ${r.remarks} ${r.source} ${r.date}`.toLowerCase();
-        if (!text.includes(q)) return false;
-      }
-
-      return true;
-    });
-  }, [rows, search, statusFilters, typeFilter, sourceFilter, fromDateFilter, toDateFilter]);
-
-  const userFilteredRows = useMemo(
-    () => userFilters.length === 0 ? globallyFilteredRows : globallyFilteredRows.filter((row) => userFilters.includes(row.userName)),
-    [globallyFilteredRows, userFilters]
-  );
-
-  const filteredRows = useMemo(
-    () => categoryFilters === null ? userFilteredRows : userFilteredRows.filter((row) => categoryFilters.includes(row.category)),
-    [userFilteredRows, categoryFilters]
-  );
-
-  // Summary computed dynamically over filtered rows
-  const activeSummary = useMemo(() => {
-    let exp = 0;
-    let cr = 0;
-    let db = 0;
-    let grand = 0;
-
-    filteredRows.forEach((r) => {
-      const a = Number(r.amount || 0);
-      if (r.type === "expense") exp += a;
-      else if (r.type === "credit") cr += a;
-      else if (r.type === "debit") db += a;
-      grand += a;
-    });
-
+  const facets = useMemo(() => {
+    const rows = section?.rows || [];
     return {
-      expenseTotal: exp,
-      creditTotal: cr,
-      debitTotal: db,
-      grandTotal: grand,
-      netCreditDebit: cr - db,
-      count: filteredRows.length,
-      avg: filteredRows.length > 0 ? grand / filteredRows.length : 0,
+      users: Array.from(new Set(rows.map((r) => r.userName).filter(Boolean))).sort(),
+      categories: Array.from(new Set(rows.filter((r) => r.type === "expense").map((r) => r.category).filter(Boolean))).sort(),
+      sources: Array.from(new Set(rows.filter((r) => r.type === "expense").map((r) => r.source).filter(Boolean))).sort(),
+      types: Array.from(new Set(rows.map((r) => r.type))),
     };
-  }, [filteredRows]);
+  }, [section]);
 
-  // Groupings for analysis tabs
-  const byUserAnalysis = useMemo(() => {
-    const map: Record<string, { total: number; count: number }> = {};
-    globallyFilteredRows.forEach((r) => {
-      const key = r.userName || "Unknown";
-      if (!map[key]) map[key] = { total: 0, count: 0 };
-      map[key].total += Number(r.amount || 0);
-      map[key].count += 1;
-    });
-    return Object.entries(map).sort((a, b) => b[1].total - a[1].total);
-  }, [globallyFilteredRows]);
-
-  const byCategoryAnalysis = useMemo(() => {
-    const map: Record<string, { total: number; count: number }> = {};
-    userFilteredRows.forEach((r) => {
-      const key = r.category || "Uncategorized";
-      if (!map[key]) map[key] = { total: 0, count: 0 };
-      map[key].total += Number(r.amount || 0);
-      map[key].count += 1;
-    });
-    return Object.entries(map).sort((a, b) => b[1].total - a[1].total);
-  }, [userFilteredRows]);
-
-  const byDateAnalysis = useMemo(() => {
-    const map: Record<string, { total: number; count: number }> = {};
-    filteredRows.forEach((r) => {
-      const key = r.date || "Unknown";
-      if (!map[key]) map[key] = { total: 0, count: 0 };
-      map[key].total += Number(r.amount || 0);
-      map[key].count += 1;
-    });
-    return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
-  }, [filteredRows]);
-
-  const globalFacetTotal = useMemo(() => globallyFilteredRows.reduce((sum, row) => sum + Number(row.amount || 0), 0), [globallyFilteredRows]);
-  const userFacetTotal = useMemo(() => userFilteredRows.reduce((sum, row) => sum + Number(row.amount || 0), 0), [userFilteredRows]);
-
-  // Pagination
-  const totalPages = Math.ceil(filteredRows.length / pageSize) || 1;
-  const paginatedRows = useMemo(() => {
-    const start = (currentPage - 1) * pageSize;
-    return filteredRows.slice(start, start + pageSize);
-  }, [filteredRows, currentPage, pageSize]);
-
-  // ─── Actions ────────────────────────────────────────────────────────────────
-
-  const currentUrl = typeof window !== "undefined" ? window.location.href : "";
-
-  const handleCopyLink = () => {
-    if (!currentUrl) return;
-    navigator.clipboard.writeText(currentUrl).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2200);
-    });
+  const exportUrl = (format: "pdf" | "xlsx") => {
+    const q = rowFiltersToQuery(filters);
+    return `/api/reports/share/${token}/export?format=${format}${section ? `&section=${section.key}` : ""}${q ? `&${q}` : ""}`;
   };
 
-  const handleShareWhatsApp = () => {
-    if (!snapshot) return;
-    const text =
-      `*CashWise Report:* ${snapshot.scheduleName || "Executive Summary"}\n` +
-      `📅 Period: ${snapshot.fromDate} to ${snapshot.toDate}\n` +
-      `💰 Total: ${fmtINR(activeSummary.grandTotal)} (${activeSummary.count} records)\n` +
-      `🔗 View Report: ${currentUrl}\n` +
-      `_Note: Link valid for 24 hours._`;
-    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, "_blank");
-  };
-
-  const handleShareEmail = () => {
-    if (!snapshot) return;
-    const subject = `CashWise Report: ${snapshot.scheduleName || "Executive Summary"}`;
-    const body =
-      `Hello,\n\nPlease find the financial report details below:\n\n` +
-      `Report: ${snapshot.scheduleName || "Financial Report"}\n` +
-      `Type: ${snapshot.reportType.toUpperCase()}\n` +
-      `Period: ${snapshot.fromDate} to ${snapshot.toDate}\n` +
-      `Total: ${fmtINR(activeSummary.grandTotal)}\n` +
-      `Transactions: ${activeSummary.count}\n\n` +
-      `Access the full report dashboard securely at:\n${currentUrl}\n\n` +
-      `This temporary link will expire 24 hours from generation.\n\n` +
-      `Best regards,\nCashWise Finance`;
-    window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`);
-  };
-
-  const handleDownloadPDF = () => {
-    if (!snapshot) return;
-    const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
-
-    // Header banner
-    doc.setFillColor(30, 41, 59);
-    doc.rect(0, 0, 297, 24, "F");
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text(snapshot.scheduleName || "CashWise Report", 14, 11);
-
-    doc.setFontSize(8.5);
-    doc.setFont("helvetica", "normal");
-    doc.text(
-      `Period: ${snapshot.fromDate} to ${snapshot.toDate}  |  Type: ${(snapshot.reportType || "EXPENSE").toUpperCase()}  |  Records: ${activeSummary.count}  |  Grand Total: ${fmtINR(activeSummary.grandTotal)}`,
-      14,
-      18
-    );
-
-    // Summary strip
-    doc.setFillColor(241, 245, 249);
-    doc.rect(0, 24, 297, 12, "F");
-    doc.setTextColor(15, 23, 42);
-    doc.setFontSize(8);
-    doc.setFont("helvetica", "bold");
-    doc.text(`Expense: ${fmtINR(activeSummary.expenseTotal)}`, 14, 31);
-    doc.text(`Credit: ${fmtINR(activeSummary.creditTotal)}`, 85, 31);
-    doc.text(`Debit: ${fmtINR(activeSummary.debitTotal)}`, 150, 31);
-    doc.text(`Grand Total: ${fmtINR(activeSummary.grandTotal)}`, 220, 31);
-
-    // Table
-    const tableCols = ["#", "Date", "User", "Type", "Source", "Category", "Site / Party", "Amount", "Status", "Description"];
-    const tableRows = filteredRows.map((r, i) => [
-      String(i + 1),
-      r.date,
-      r.userName,
-      r.type,
-      r.source || "—",
-      r.category || "—",
-      r.siteName || "—",
-      fmtINR(r.amount),
-      r.status,
-      (r.description || r.remarks || "—").slice(0, 60),
-    ]);
-
-    autoTable(doc, {
-      head: [tableCols],
-      body: tableRows,
-      startY: 40,
-      styles: { fontSize: 7, cellPadding: 2 },
-      headStyles: { fillColor: [79, 70, 229], textColor: 255, fontStyle: "bold" },
-      alternateRowStyles: { fillColor: [248, 250, 252] },
-      columnStyles: { 7: { halign: "right", fontStyle: "bold" } },
-      margin: { left: 14, right: 14 },
-    });
-
-    const fileDate = new Date().toISOString().split("T")[0];
-    doc.save(`cashwise-report-${snapshot.fromDate}-${fileDate}.pdf`);
-  };
-
-  // ─── Status Screen Renders ──────────────────────────────────────────────────
-
-  if (state === "loading") {
-    return (
-      <div style={styles.centerBox}>
-        <div style={styles.spinner} />
-        <h2 style={{ fontSize: 18, color: "#1e293b", margin: "16px 0 6px" }}>Loading Report</h2>
-        <p style={{ color: "#64748b", fontSize: 13, margin: 0 }}>Validating secure 24-hour access token…</p>
-      </div>
-    );
-  }
-
+  // ── Status screens ──
+  if (state === "loading") return <LoadingState />;
   if (state === "expired") {
     return (
-      <div style={styles.centerBox}>
-        <div style={styles.stateCard}>
-          <div style={{ fontSize: 44, marginBottom: 12 }}>⏱️</div>
-          <h1 style={styles.stateTitle}>Report Link Expired</h1>
-          <p style={styles.stateText}>
-            For security, shareable report links in CashWise expire automatically after <strong>24 hours</strong>.
-          </p>
-          {expiresAt && (
-            <div style={styles.timeTag}>
-              Expired on: {new Date(expiresAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
-            </div>
-          )}
-          <p style={{ ...styles.stateText, fontSize: 12, marginTop: 14, color: "#94a3b8" }}>
-            Please contact your CashWise administrator to generate or email an updated report.
-          </p>
-        </div>
-      </div>
+      <StateCard icon={<FiClock className="w-7 h-7" />} tone="amber" title="This report link has expired">
+        For security, shared CashWise reports stop working after a set time.
+        {expiresAt && (
+          <span className="block mt-3 text-xs font-semibold text-amber-800 bg-amber-50 rounded-full px-3 py-1 w-fit mx-auto">
+            Expired {new Date(expiresAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+          </span>
+        )}
+        <span className="block mt-3">Ask your CashWise administrator to send a fresh report.</span>
+      </StateCard>
     );
   }
-
   if (state === "revoked") {
     return (
-      <div style={styles.centerBox}>
-        <div style={styles.stateCard}>
-          <div style={{ fontSize: 44, marginBottom: 12 }}>🔒</div>
-          <h1 style={styles.stateTitle}>Access Revoked</h1>
-          <p style={styles.stateText}>This report link has been revoked by the administrator.</p>
-        </div>
-      </div>
+      <StateCard icon={<FiLock className="w-7 h-7" />} tone="slate" title="Access revoked">
+        The administrator has turned off this report link.
+      </StateCard>
     );
   }
-
   if (state === "not_found") {
     return (
-      <div style={styles.centerBox}>
-        <div style={styles.stateCard}>
-          <div style={{ fontSize: 44, marginBottom: 12 }}>🔍</div>
-          <h1 style={styles.stateTitle}>Report Not Found</h1>
-          <p style={styles.stateText}>The requested report does not exist or may have already been purged.</p>
-        </div>
-      </div>
+      <StateCard icon={<FiSearch className="w-7 h-7" />} tone="slate" title="Report not found">
+        This link is incomplete or the report has been removed. Check that you copied the whole link.
+      </StateCard>
     );
   }
-
-  if (state === "error" || !snapshot) {
+  if (state === "error" || !snapshot || !section) {
     return (
-      <div style={styles.centerBox}>
-        <div style={styles.stateCard}>
-          <div style={{ fontSize: 44, marginBottom: 12 }}>⚠️</div>
-          <h1 style={styles.stateTitle}>Unable to Display Report</h1>
-          <p style={styles.stateText}>{errorMsg || "An unexpected error occurred."}</p>
-          <button onClick={loadReport} style={styles.primaryBtn}>
-            Try Again
-          </button>
-        </div>
-      </div>
+      <StateCard icon={<FiAlertTriangle className="w-7 h-7" />} tone="red" title="Couldn’t open the report">
+        {errorMsg || "Something went wrong."}
+        <button
+          onClick={loadReport}
+          className="mt-5 inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-700"
+        >
+          <FiRefreshCw className="w-4 h-4" /> Try again
+        </button>
+      </StateCard>
     );
   }
 
-  // ─── Dashboard Screen ───────────────────────────────────────────────────────
-
-  const theme = TYPE_THEMES[snapshot.reportType] || TYPE_THEMES.expense;
-  const hasCreditsOrDebits = ["credit", "debit", "combined"].includes(snapshot.reportType);
+  const title = snapshot.scheduleName || "Expense Report";
+  const typeLabel = TYPE_LABEL[snapshot.reportType] || labelize(snapshot.reportType);
+  const isCombined = facets.types.length > 1;
+  const multiDay = section.from !== section.to;
+  const generated = snapshot.generatedAt || (createdAt ? new Date(createdAt).toLocaleString("en-IN") : "");
 
   return (
-    <div style={styles.page}>
-      {/* ── Top Header ──────────────────────────────────────────────────────── */}
-      <header style={styles.topHeader}>
-        <div style={styles.headerLeft}>
-          <div style={{ ...styles.logoBadge, background: theme.primary }}>
-            {snapshot.reportType === "credit" ? "💳" : snapshot.reportType === "debit" ? "🧾" : "📊"}
+    <div className="min-h-screen bg-slate-50 pb-28 md:pb-12 text-slate-900">
+      {/* ── Header ── */}
+      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/90 backdrop-blur">
+        <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-sm">
+            <FiGrid className="h-5 w-5" />
           </div>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-              <h1 style={styles.reportTitle}>{snapshot.scheduleName || "Executive Expense Report"}</h1>
-              <span style={{ ...styles.badge, background: theme.light, color: theme.primary, borderColor: theme.border }}>
-                {snapshot.period.toUpperCase()} · {snapshot.reportType.toUpperCase()}
-              </span>
-            </div>
-            <p style={styles.reportMeta}>
-              <span>Period: <strong>{fmtDate(snapshot.fromDate)}</strong> to <strong>{fmtDate(snapshot.toDate)}</strong></span>
-              {expiresAt && (
-                <span style={{ color: "#d97706", marginLeft: 12 }}>
-                  ⏳ Link valid until {new Date(expiresAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}
-                </span>
-              )}
-            </p>
+          <div className="min-w-0 flex-1">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-indigo-600">CashWise · {typeLabel}</div>
+            <h1 className="truncate text-base font-bold leading-tight sm:text-lg">{title}</h1>
           </div>
-        </div>
-
-        {/* Share & Export Actions */}
-        <div style={styles.headerActions}>
-          <button onClick={handleDownloadPDF} style={{ ...styles.actionBtn, background: theme.primary, color: "#fff" }}>
-            📥 Download PDF
-          </button>
-          <button onClick={handleShareWhatsApp} style={{ ...styles.actionBtn, background: "#25d366", color: "#fff" }}>
-            WhatsApp
-          </button>
-          <button onClick={handleShareEmail} style={{ ...styles.actionBtn, background: "#0284c7", color: "#fff" }}>
-            Email
-          </button>
-          <button onClick={handleCopyLink} style={{ ...styles.actionBtn, background: copied ? "#16a34a" : "#e2e8f0", color: copied ? "#fff" : "#1e293b" }}>
-            {copied ? "✓ Copied" : "🔗 Copy Link"}
-          </button>
+          <div className="hidden items-center gap-2 md:flex">
+            <a href={exportUrl("pdf")} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+              <FiFileText className="h-4 w-4" /> PDF
+            </a>
+            <a href={exportUrl("xlsx")} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+              <FiDownload className="h-4 w-4" /> Excel
+            </a>
+            <button onClick={() => setShareOpen(true)} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700">
+              <FiShare2 className="h-4 w-4" /> Share
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* ── Main Dashboard Content ──────────────────────────────────────────── */}
-      <main style={styles.mainContainer}>
-        {/* KPI Cards */}
-        <div style={styles.kpiGrid}>
-          <div style={{ ...styles.kpiCard, borderTop: `4px solid ${theme.primary}` }}>
-            <div style={styles.kpiLabel}>Grand Total</div>
-            <div style={{ ...styles.kpiVal, color: theme.primary }}>{fmtINR(activeSummary.grandTotal)}</div>
-            <div style={styles.kpiSub}>{activeSummary.count} transactions included</div>
-          </div>
-
-          <div style={{ ...styles.kpiCard, borderTop: "4px solid #10b981" }}>
-            <div style={styles.kpiLabel}>Expense Total</div>
-            <div style={{ ...styles.kpiVal, color: "#10b981" }}>{fmtINR(activeSummary.expenseTotal)}</div>
-            <div style={styles.kpiSub}>{filteredRows.filter((r) => r.type === "expense").length} expense records</div>
-          </div>
-
-          {hasCreditsOrDebits && (
-            <>
-              <div style={{ ...styles.kpiCard, borderTop: "4px solid #16a34a" }}>
-                <div style={styles.kpiLabel}>Credit Total</div>
-                <div style={{ ...styles.kpiVal, color: "#16a34a" }}>{fmtINR(activeSummary.creditTotal)}</div>
-                <div style={styles.kpiSub}>{filteredRows.filter((r) => r.type === "credit").length} credit records</div>
-              </div>
-
-              <div style={{ ...styles.kpiCard, borderTop: "4px solid #dc2626" }}>
-                <div style={styles.kpiLabel}>Debit Total</div>
-                <div style={{ ...styles.kpiVal, color: "#dc2626" }}>{fmtINR(activeSummary.debitTotal)}</div>
-                <div style={styles.kpiSub}>{filteredRows.filter((r) => r.type === "debit").length} debit records</div>
-              </div>
-              <div style={{ ...styles.kpiCard, borderTop: "4px solid #0ea5e9" }}>
-                <div style={styles.kpiLabel}>Net Credit − Debit</div>
-                <div style={{ ...styles.kpiVal, color: activeSummary.netCreditDebit >= 0 ? "#0284c7" : "#dc2626" }}>
-                  {fmtINR(activeSummary.netCreditDebit)}
-                </div>
-                <div style={styles.kpiSub}>credit less debit for the current filters</div>
-              </div>
-            </>
-          )}
-
-          <div style={{ ...styles.kpiCard, borderTop: "4px solid #8b5cf6" }}>
-            <div style={styles.kpiLabel}>Average per Entry</div>
-            <div style={{ ...styles.kpiVal, color: "#8b5cf6" }}>{fmtINR(activeSummary.avg)}</div>
-            <div style={styles.kpiSub}>across filtered items</div>
-          </div>
-        </div>
-
-        {/* Filter Controls Bar */}
-        <div style={styles.filterBar}>
-          <input
-            type="text"
-            placeholder="🔍 Search user, description, category, site..."
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              setCurrentPage(1);
-            }}
-            style={styles.searchInput}
-          />
-
-          <select
-            value={userFilters.length === 1 ? userFilters[0] : "all"}
-            onChange={(e) => {
-              setUserFilters(e.target.value === "all" ? [] : [e.target.value]);
-              setCategoryFilters(null);
-              setCurrentPage(1);
-            }}
-            style={styles.filterDropdown}
-          >
-            <option value="all">{userFilters.length > 1 ? `${userFilters.length} users selected` : `All Users (${uniqueUsers.length})`}</option>
-            {uniqueUsers.map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-
-          <select value={sourceFilter} onChange={(e) => { setSourceFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown}>
-            <option value="all">All Expense Types</option>
-            {uniqueSources.map((source) => <option key={source} value={source}>{source === "toPay" ? "To Pay" : source}</option>)}
-          </select>
-
-          <input aria-label="From date" type="date" value={fromDateFilter}
-            onChange={(e) => { setFromDateFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown} />
-          <input aria-label="To date" type="date" value={toDateFilter}
-            onChange={(e) => { setToDateFilter(e.target.value); setCurrentPage(1); }} style={styles.filterDropdown} />
-
-          <button onClick={() => { setSearch(""); setStatusFilters([]); setUserFilters([]); setCategoryFilters(null); setTypeFilter("all"); setSourceFilter("all"); setFromDateFilter(""); setToDateFilter(""); setCurrentPage(1); }} style={styles.pageBtn}>
-            Reset filters
-          </button>
-
-          <div style={{ marginLeft: "auto", fontSize: 13, color: "#64748b", fontWeight: 600 }}>
-            Showing {filteredRows.length} of {rows.length}
-          </div>
-        </div>
-
-        <div style={styles.quickFilterPanel}>
-          <div style={styles.filterGroup}>
-            <div style={styles.filterLabel}>Report Type</div>
-            <div style={styles.chipRow}>
-              {(["all", "expense", "credit", "debit"] as const).map((type) => {
-                const count = type === "all" ? rows.length : rows.filter((row) => row.type === type).length;
-                return <button key={type} onClick={() => { setTypeFilter(type); setCurrentPage(1); }} style={{ ...styles.filterChip, ...(typeFilter === type ? styles.filterChipActive : {}) }}>
-                  {type === "expense" ? "📊" : type === "credit" ? "💳" : type === "debit" ? "🧾" : "📈"} {type === "all" ? "Combined" : type[0].toUpperCase() + type.slice(1)} <strong>{count}</strong>
-                </button>;
-              })}
-            </div>
-          </div>
-
-          <div style={styles.filterGroup}>
-            <div style={styles.filterLabel}>Status</div>
-            <div style={styles.chipRow}>
-              {["pending", "approved", "rejected"].map((status) => <button key={status}
-                onClick={() => { setStatusFilters((current) => current.includes(status) ? current.filter((item) => item !== status) : [...current, status]); setCurrentPage(1); }}
-                style={{ ...styles.filterChip, ...(statusFilters.includes(status) ? styles.filterChipActive : {}) }}>{status[0].toUpperCase() + status.slice(1)}</button>)}
-            </div>
-          </div>
-
-          <details style={styles.advancedFilters}>
-            <summary style={styles.filterSummary}>Category and table-field filters</summary>
-            <div style={styles.filterGroup}>
-              <div style={styles.filterLabel}>Filter by Category <button onClick={() => setCategoryFilters(null)} style={styles.textBtn}>All</button> · <button onClick={() => setCategoryFilters([])} style={styles.textBtn}>None</button></div>
-              <div style={styles.chipRow}>{uniqueCategories.map((category) => <button key={category}
-                onClick={() => { setCategoryFilters((current) => current === null ? [category] : current.includes(category) ? current.filter((item) => item !== category) : [...current, category]); setCurrentPage(1); }}
-                style={{ ...styles.filterChip, ...(categoryFilters === null || categoryFilters.includes(category) ? styles.filterChipActive : {}) }}>{category}</button>)}</div>
-            </div>
-            <div style={styles.filterGroup}>
-              <div style={styles.filterLabel}>Table Fields <button onClick={() => setVisibleFields(["date", "user", "type", "source", "category", "site", "amount", "status", "description", "attachments"])} style={styles.textBtn}>All</button> · <button onClick={() => setVisibleFields(["date", "user", "site", "category", "amount", "status"])} style={styles.textBtn}>Default</button></div>
-              <div style={styles.chipRow}>{[
-                ["date", "Date"], ["user", "User"], ["type", "Type"], ["source", "Expense Type"], ["category", "Category"], ["site", "Site/Party"], ["amount", "Amount"], ["status", "Status"], ["description", "Description"], ["attachments", "Attachments"],
-              ].map(([field, label]) => <button key={field} onClick={() => setVisibleFields((current) => current.includes(field) ? current.filter((item) => item !== field) : [...current, field])}
-                style={{ ...styles.filterChip, ...(visibleFields.includes(field) ? styles.filterChipActive : {}) }}>{label}</button>)}</div>
-            </div>
-          </details>
-        </div>
-
-        {/* View Tabs */}
-        <div style={styles.tabNav}>
-          <button
-            onClick={() => setActiveTab("table")}
-            style={{ ...styles.tabBtn, ...(activeTab === "table" ? styles.tabBtnActive : {}) }}
-          >
-            📋 Detailed Transactions ({filteredRows.length})
-          </button>
-          <button
-            onClick={() => setActiveTab("user")}
-            style={{ ...styles.tabBtn, ...(activeTab === "user" ? styles.tabBtnActive : {}) }}
-          >
-            👤 By User ({byUserAnalysis.length})
-          </button>
-          <button
-            onClick={() => setActiveTab("category")}
-            style={{ ...styles.tabBtn, ...(activeTab === "category" ? styles.tabBtnActive : {}) }}
-          >
-            🏷 By Category ({byCategoryAnalysis.length})
-          </button>
-          <button
-            onClick={() => setActiveTab("date")}
-            style={{ ...styles.tabBtn, ...(activeTab === "date" ? styles.tabBtnActive : {}) }}
-          >
-            📅 By Date ({byDateAnalysis.length})
-          </button>
-        </div>
-
-        {/* ── Tab Content: Detailed Table ─────────────────────────────────────── */}
-        {activeTab === "table" && (
-          <div style={styles.tableCard}>
-            {filteredRows.length === 0 ? (
-              <div style={styles.emptyNotice}>
-                <div style={{ fontSize: 36 }}>📂</div>
-                <h3 style={{ margin: "10px 0 4px", color: "#334155" }}>No records match your filters</h3>
-                <p style={{ margin: 0, color: "#94a3b8", fontSize: 13 }}>Try clearing your search or status filters</p>
-              </div>
-            ) : (
-              <>
-                <div style={{ overflowX: "auto" }}>
-                  <table style={styles.table}>
-                    <thead>
-                      <tr style={styles.tableHeadRow}>
-                        <th style={{ ...styles.th, width: 44, textAlign: "center" }}>#</th>
-                        {visibleFields.includes("date") && <th style={styles.th}>Date</th>}
-                        {visibleFields.includes("user") && <th style={styles.th}>User</th>}
-                        {visibleFields.includes("type") && <th style={styles.th}>Type</th>}
-                        {visibleFields.includes("source") && <th style={styles.th}>Expense Type</th>}
-                        {visibleFields.includes("category") && <th style={styles.th}>Head / Category</th>}
-                        {visibleFields.includes("site") && <th style={styles.th}>Site / Party</th>}
-                        {visibleFields.includes("amount") && <th style={{ ...styles.th, textAlign: "right" }}>Amount</th>}
-                        {visibleFields.includes("status") && <th style={styles.th}>Status</th>}
-                        {visibleFields.includes("description") && <th style={styles.th}>Description / Remarks</th>}
-                        {visibleFields.includes("attachments") && <th style={{ ...styles.th, textAlign: "center" }}>Attachments</th>}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {paginatedRows.map((row, idx) => {
-                        const globalIndex = (currentPage - 1) * pageSize + idx + 1;
-                        const stBadge = STATUS_BADGES[row.status?.toLowerCase()] || STATUS_BADGES.default;
-
-                        return (
-                          <tr key={row._id || idx} style={idx % 2 === 0 ? styles.trEven : styles.trOdd}>
-                            <td style={{ ...styles.td, textAlign: "center", color: "#94a3b8", fontSize: 11 }}>
-                              {globalIndex}
-                            </td>
-                            {visibleFields.includes("date") && <td style={{ ...styles.td, whiteSpace: "nowrap", fontWeight: 500 }}>
-                              {fmtDate(row.date)}
-                            </td>}
-                            {visibleFields.includes("user") && <td style={{ ...styles.td, fontWeight: 600, color: "#0f172a" }}>
-                              {row.userName || "—"}
-                            </td>}
-                            {visibleFields.includes("type") && (
-                              <td style={styles.td}>
-                                <span
-                                  style={{
-                                    ...styles.badge,
-                                    textTransform: "uppercase",
-                                    fontSize: 10,
-                                    background: TYPE_THEMES[row.type]?.light || "#f1f5f9",
-                                    color: TYPE_THEMES[row.type]?.primary || "#475569",
-                                    borderColor: TYPE_THEMES[row.type]?.border || "#cbd5e1",
-                                  }}
-                                >
-                                  {row.type}
-                                </span>
-                              </td>
-                            )}
-                            {visibleFields.includes("source") && <td style={{ ...styles.td, textTransform: "capitalize", color: "#64748b" }}>
-                              {row.source || "—"}
-                            </td>}
-                            {visibleFields.includes("category") && <td style={styles.td}>
-                              <span style={styles.categoryPill}>{row.category || "—"}</span>
-                            </td>}
-                            {visibleFields.includes("site") && <td style={{ ...styles.td, color: "#334155" }}>{row.siteName || "—"}</td>}
-                            {visibleFields.includes("amount") && <td style={{ ...styles.td, textAlign: "right", fontWeight: 700, color: theme.primary, fontVariantNumeric: "tabular-nums" }}>
-                              {fmtINR(row.amount)}
-                            </td>}
-                            {visibleFields.includes("status") && <td style={styles.td}>
-                              <span
-                                style={{
-                                  ...styles.badge,
-                                  background: stBadge.bg,
-                                  color: stBadge.text,
-                                  borderColor: stBadge.border,
-                                }}
-                              >
-                                {row.status || "—"}
-                              </span>
-                            </td>}
-                            {visibleFields.includes("description") && <td style={{ ...styles.td, maxWidth: 260, color: "#475569", fontSize: 12 }}>
-                              {row.description || row.remarks || "—"}
-                            </td>}
-                            {visibleFields.includes("attachments") && <td style={{ ...styles.td, textAlign: "center" }}>
-                              {row.attachments && row.attachments.length > 0 ? (
-                                <div style={{ display: "flex", gap: 4, justifyContent: "center", flexWrap: "wrap" }}>
-                                  {row.attachments.map((url, aIdx) => (
-                                    <button
-                                      key={aIdx}
-                                      onClick={() => setPreviewImage(url)}
-                                      style={styles.attachmentPill}
-                                      title="Click to view file"
-                                    >
-                                      📎 #{aIdx + 1}
-                                    </button>
-                                  ))}
-                                </div>
-                              ) : (
-                                <span style={{ color: "#cbd5e1" }}>—</span>
-                              )}
-                            </td>}
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                    <tfoot>
-                      <tr style={styles.tfootRow}>
-                        <td colSpan={Math.max(1, visibleFields.length + 1)} style={{ ...styles.td, fontWeight: 800, color: theme.primary, fontSize: 14 }}>
-                          Filtered total: {fmtINR(activeSummary.grandTotal)} · {filteredRows.length} transactions
-                        </td>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
-
-                {/* Pagination Bar */}
-                {totalPages > 1 && (
-                  <div style={styles.paginationBar}>
-                    <button
-                      onClick={() => setCurrentPage(1)}
-                      disabled={currentPage <= 1}
-                      style={styles.pageBtn}
-                    >
-                      « First
-                    </button>
-                    <button
-                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                      disabled={currentPage <= 1}
-                      style={styles.pageBtn}
-                    >
-                      ‹ Previous
-                    </button>
-                    <span style={styles.pageText}>
-                      Page <strong>{currentPage}</strong> of <strong>{totalPages}</strong>
-                    </span>
-                    <button
-                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                      disabled={currentPage >= totalPages}
-                      style={styles.pageBtn}
-                    >
-                      Next ›
-                    </button>
-                    <button
-                      onClick={() => setCurrentPage(totalPages)}
-                      disabled={currentPage >= totalPages}
-                      style={styles.pageBtn}
-                    >
-                      Last »
-                    </button>
-                  </div>
-                )}
-              </>
+      <main className="mx-auto max-w-6xl space-y-4 px-4 pt-4 sm:space-y-5 sm:pt-6">
+        {/* ── Meta + period switcher ── */}
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500">
+            {snapshot.scheduleDescription && <span>{snapshot.scheduleDescription}</span>}
+            {generated && <span>· Generated {generated}</span>}
+            {expiresAt && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 font-medium text-amber-800 ring-1 ring-amber-200">
+                <FiLock className="h-3 w-3" /> Link valid until {new Date(expiresAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+              </span>
             )}
           </div>
-        )}
 
-        {/* ── Tab Content: By User ────────────────────────────────────────────── */}
-        {activeTab === "user" && (
-          <div style={styles.analysisGrid}>
-            {byUserAnalysis.map(([name, data]) => {
-              const pct = calcPct(data.total, globalFacetTotal);
-              const selected = userFilters.includes(name);
-              return (
-                <button key={name} type="button" aria-pressed={selected}
-                  onClick={() => { setUserFilters((current) => current.includes(name) ? current.filter((item) => item !== name) : [...current, name]); setCurrentPage(1); }}
-                  style={{ ...styles.analysisCard, ...styles.analysisButton, ...(selected ? styles.analysisCardSelected : {}) }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-                    <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>👤 {name}</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: theme.primary }}>{fmtINR(data.total)}</div>
-                  </div>
-                  <div style={styles.progressTrack}>
-                    <div style={{ ...styles.progressFill, width: pct, background: theme.primary }} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#64748b", marginTop: 6 }}>
-                    <span>{data.count} transaction{data.count !== 1 ? "s" : ""}</span>
-                    <span><strong>{pct}</strong> of total</span>
-                  </div>
-                  <div style={styles.cardSelectionHint}>{selected ? "✓ Selected — click to remove" : "+ Add user to filter"}</div>
-                </button>
-              );
-            })}
+          {sections.length > 1 && (
+            <div role="tablist" aria-label="Report period" className="grid grid-cols-3 gap-1 rounded-2xl bg-slate-200/70 p-1">
+              {sections.map((s) => {
+                const active = s.key === section.key;
+                return (
+                  <button
+                    key={s.key}
+                    role="tab"
+                    aria-selected={active}
+                    onClick={() => setActiveKey(s.key)}
+                    className={`rounded-xl px-2 py-2 text-center transition ${active ? "bg-white shadow-sm" : "hover:bg-white/60"}`}
+                  >
+                    <div className={`text-xs font-bold sm:text-sm ${active ? "text-indigo-700" : "text-slate-600"}`}>{s.label}</div>
+                    <div className="truncate text-[10px] text-slate-500 sm:text-xs">{s.rangeLabel}</div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* ── Headline numbers ── */}
+        <section className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+          <div className="col-span-2 rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-5">
+            <div className="text-xs font-semibold text-slate-500">
+              Total expenses · {sections.length > 1 ? section.label : section.rangeLabel}
+            </div>
+            <div className="mt-1 font-extrabold leading-tight tracking-tight text-slate-900" style={{ fontSize: "clamp(30px, 8vw, 46px)" }}>
+              {fmtINR(digest.expense.total)}
+            </div>
+            <div className="mt-1 text-xs text-slate-500">
+              {digest.expense.count} entr{digest.expense.count === 1 ? "y" : "ies"} · approved + pending · rejected not counted
+            </div>
+            <StatusBar digest={digest} />
           </div>
-        )}
-
-        {/* ── Tab Content: By Category ────────────────────────────────────────── */}
-        {activeTab === "category" && (
-          <div style={styles.analysisGrid}>
-            {byCategoryAnalysis.map(([cat, data]) => {
-              const pct = calcPct(data.total, userFacetTotal);
-              const selected = categoryFilters === null || categoryFilters.includes(cat);
-              return (
-                <button key={cat} type="button" aria-pressed={selected}
-                  onClick={() => { setCategoryFilters((current) => current === null ? [cat] : current.includes(cat) ? current.filter((item) => item !== cat) : [...current, cat]); setCurrentPage(1); }}
-                  style={{ ...styles.analysisCard, ...styles.analysisButton, ...(selected && categoryFilters !== null ? styles.analysisCardSelected : {}) }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-                    <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>🏷️ {cat}</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#0891b2" }}>{fmtINR(data.total)}</div>
-                  </div>
-                  <div style={styles.progressTrack}>
-                    <div style={{ ...styles.progressFill, width: pct, background: "#0891b2" }} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#64748b", marginTop: 6 }}>
-                    <span>{data.count} item{data.count !== 1 ? "s" : ""}</span>
-                    <span><strong>{pct}</strong> of total</span>
-                  </div>
-                  <div style={styles.cardSelectionHint}>{categoryFilters === null ? "+ Click to focus this category" : selected ? "✓ Selected — click to remove" : "+ Add category to filter"}</div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
-        {/* ── Tab Content: By Date ────────────────────────────────────────────── */}
-        {activeTab === "date" && (
-          <div style={styles.analysisGrid}>
-            {byDateAnalysis.map(([date, data]) => {
-              const pct = calcPct(data.total, activeSummary.grandTotal);
-              return (
-                <div key={date} style={styles.analysisCard}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
-                    <div style={{ fontWeight: 700, fontSize: 15, color: "#1e293b" }}>📅 {fmtDate(date)}</div>
-                    <div style={{ fontWeight: 800, fontSize: 16, color: "#16a34a" }}>{fmtINR(data.total)}</div>
-                  </div>
-                  <div style={styles.progressTrack}>
-                    <div style={{ ...styles.progressFill, width: pct, background: "#16a34a" }} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#64748b", marginTop: 6 }}>
-                    <span>{data.count} entry{data.count !== 1 ? "ies" : "y"}</span>
-                    <span><strong>{pct}</strong> of total</span>
-                  </div>
+          {(["approved", "pending", "rejected"] as const).map((key) => {
+            const s = STATUS[key];
+            const v = digest.expense[key];
+            const active = filters.statuses?.length === 1 && filters.statuses[0] === key;
+            return (
+              <button
+                key={key}
+                onClick={() => setFilters((f) => ({ ...f, statuses: active ? [] : [key] }))}
+                className={`rounded-2xl bg-white p-4 text-left shadow-sm ring-1 transition hover:ring-indigo-300 ${active ? "ring-2 ring-indigo-500" : "ring-slate-200"} ${key === "rejected" ? "col-span-2 lg:col-span-1" : ""} lg:flex lg:flex-col lg:justify-center`}
+              >
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-500">
+                  <s.Icon className="h-3.5 w-3.5" style={{ color: s.color }} /> {s.label}
                 </div>
-              );
-            })}
-          </div>
+                <div className="mt-1 text-lg font-bold sm:text-xl">{fmtINR(v.total)}</div>
+                <div className="text-xs text-slate-500">
+                  {v.count} entr{v.count === 1 ? "y" : "ies"}
+                  {key === "rejected" && " · not counted"}
+                </div>
+              </button>
+            );
+          })}
+        </section>
+
+        {/* ── Cash statement ── */}
+        {(digest.cash.received.count > 0 || digest.cash.spent.count > 0 || cashPosition) && (
+          <CashCard digest={digest} cashPosition={cashPosition || null} filtersActive={filtersActive} />
         )}
 
-        {/* ── Footer ──────────────────────────────────────────────────────────── */}
-        <footer style={styles.pageFooter}>
-          <div>
-            <strong>CashWise Financial Intelligence</strong> · Automated Executive Expense Summary
+        {/* ── Breakdowns ── */}
+        <section className="grid gap-4 md:grid-cols-2">
+          <BreakdownCard
+            title="Where the money went"
+            subtitle="Expenses by category"
+            buckets={digest.expense.byCategory}
+            whole={digest.expense.total}
+            labelFn={labelize}
+            selected={filters.categories || []}
+            onToggle={(k) => setFilters((f) => ({ ...f, categories: toggle(f.categories, k) }))}
+          />
+          <BreakdownCard
+            title="Who spent it"
+            subtitle="Expenses by employee"
+            buckets={digest.expense.byUser}
+            whole={digest.expense.total}
+            selected={filters.users || []}
+            onToggle={(k) => setFilters((f) => ({ ...f, users: toggle(f.users, k) }))}
+          />
+        </section>
+
+        {multiDay && <TrendCard from={section.from} to={section.to} byDate={digest.expense.byDate} />}
+
+        {/* ── Transactions ── */}
+        <section id="transactions" className="rounded-2xl bg-white shadow-sm ring-1 ring-slate-200">
+          <div className="space-y-3 border-b border-slate-100 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold">Transactions</h2>
+                <p className="text-xs text-slate-500">
+                  {filtered.length === section.rows.length
+                    ? `${section.rows.length} entr${section.rows.length === 1 ? "y" : "ies"}`
+                    : `${filtered.length} of ${section.rows.length} entries match`}
+                </p>
+              </div>
+              <select
+                value={sort}
+                onChange={(e) => setSort(e.target.value as SortKey)}
+                aria-label="Sort transactions"
+                className="rounded-xl border border-slate-200 bg-white px-2.5 py-2 text-xs font-medium text-slate-700"
+              >
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="amount">Highest amount</option>
+              </select>
+            </div>
+
+            <div className="flex gap-2">
+              <label className="relative flex-1">
+                <FiSearch className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={filters.search}
+                  onChange={(e) => setFilters((f) => ({ ...f, search: e.target.value }))}
+                  placeholder="Search site, employee, description…"
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 py-2.5 pl-9 pr-3 text-sm outline-none focus:border-indigo-400 focus:bg-white focus:ring-2 focus:ring-indigo-100"
+                />
+              </label>
+              <button
+                onClick={() => setFiltersOpen(true)}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-3 text-sm font-semibold ${filtersActive ? "border-indigo-300 bg-indigo-50 text-indigo-700" : "border-slate-200 text-slate-700 hover:bg-slate-50"}`}
+              >
+                <FiFilter className="h-4 w-4" />
+                <span className="hidden sm:inline">Filters</span>
+                {filtersActive && <span className="h-2 w-2 rounded-full bg-indigo-600" />}
+              </button>
+            </div>
+
+            {isCombined && (
+              <div className="flex gap-1.5 overflow-x-auto pb-0.5">
+                {[["all", "All"], ["expense", "Expenses"], ["credit", "Cash received"], ["debit", "Cash spent"]].map(([value, label]) => (
+                  <button
+                    key={value}
+                    onClick={() => setFilters((f) => ({ ...f, type: value }))}
+                    className={`shrink-0 rounded-full px-3 py-1.5 text-xs font-semibold ring-1 ${filters.type === value ? "bg-indigo-600 text-white ring-indigo-600" : "bg-white text-slate-600 ring-slate-200"}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {filtersActive && <ActiveFilters filters={filters} onChange={setFilters} />}
           </div>
-          <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
-            {createdAt && `Generated: ${new Date(createdAt).toLocaleString("en-IN")}  |  `}
-            Confidential · Intended solely for authorized recipients.
+
+          {sorted.length === 0 ? (
+            <div className="px-4 py-12 text-center">
+              <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+                <FiSearch className="h-5 w-5" />
+              </div>
+              <p className="mt-3 text-sm font-semibold text-slate-700">
+                {section.rows.length === 0 ? "No entries were recorded in this period" : "Nothing matches these filters"}
+              </p>
+              {filtersActive && (
+                <button onClick={() => setFilters(EMPTY_FILTERS)} className="mt-2 text-sm font-semibold text-indigo-600">
+                  Clear filters
+                </button>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* Mobile cards */}
+              <ul className="divide-y divide-slate-100 md:hidden">
+                {sorted.slice(0, visible).map((row, i) => (
+                  <TransactionCard key={`${row._id}-${i}`} row={row} onPreview={setPreview} />
+                ))}
+              </ul>
+
+              {/* Desktop table */}
+              <div className="hidden overflow-x-auto md:block">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-100 bg-slate-50 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                      <th className="px-4 py-3">Date</th>
+                      <th className="px-4 py-3">Employee</th>
+                      <th className="px-4 py-3">Category</th>
+                      <th className="px-4 py-3">Site / Party</th>
+                      <th className="px-4 py-3">Description</th>
+                      <th className="px-4 py-3">Status</th>
+                      <th className="px-4 py-3 text-right">Amount</th>
+                      <th className="px-4 py-3 text-center">Files</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {sorted.slice(0, visible).map((row, i) => {
+                      const st = statusOf(row);
+                      return (
+                        <tr key={`${row._id}-${i}`} className={`hover:bg-slate-50/70 ${st === "rejected" ? "text-slate-400" : ""}`}>
+                          <td className="whitespace-nowrap px-4 py-3 text-slate-600">{fmtDay(row.date)}</td>
+                          <td className="px-4 py-3 font-medium">{row.userName}</td>
+                          <td className="px-4 py-3">
+                            {row.type === "expense" ? labelize(row.category) : <TypeBadge type={row.type} />}
+                            {row.type === "expense" && <div className="text-[11px] text-slate-400">{labelize(row.source)}</div>}
+                          </td>
+                          <td className="max-w-[180px] px-4 py-3 text-slate-600">{row.siteName || "—"}</td>
+                          <td className="max-w-[260px] px-4 py-3 text-slate-600">
+                            <span className="line-clamp-2">{row.description || row.remarks || "—"}</span>
+                          </td>
+                          <td className="px-4 py-3">{st ? <StatusPill status={st} /> : <span className="text-slate-300">—</span>}</td>
+                          <td className={`whitespace-nowrap px-4 py-3 text-right font-semibold tabular-nums ${st === "rejected" ? "line-through" : ""}`}>
+                            {row.type === "debit" ? "−" : row.type === "credit" ? "+" : ""}
+                            {fmtINR(row.amount)}
+                          </td>
+                          <td className="px-4 py-3 text-center">
+                            <Attachments urls={row.attachments} onPreview={setPreview} />
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {visible < sorted.length && (
+                <div className="border-t border-slate-100 p-3 text-center">
+                  <button
+                    onClick={() => setVisible((v) => v + PAGE_SIZE)}
+                    className="w-full rounded-xl bg-slate-100 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-200 sm:w-auto sm:px-8"
+                  >
+                    Show more ({sorted.length - visible} left)
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+
+        <footer className="pb-4 pt-2 text-center text-[11px] leading-relaxed text-slate-400">
+          <div className="font-semibold text-slate-500">CashWise · Confidential — for authorised recipients only</div>
+          {snapshot.timezone && <div>All dates in {snapshot.timezone}.</div>}
+          <div>
+            © {new Date().getFullYear()}{" "}
+            <a href="https://intertech.com.co/" target="_blank" rel="noreferrer" className="underline">Inter-Tech</a>
+            {" · "}Designed by{" "}
+            <a href="https://iameya.in/" target="_blank" rel="noreferrer" className="underline">Ameya Innovex</a>
           </div>
         </footer>
       </main>
 
-      {/* ── Attachment Modal ────────────────────────────────────────────────── */}
-      {previewImage && (
-        <div style={styles.modalOverlay} onClick={() => setPreviewImage(null)}>
-          <div style={styles.modalBox} onClick={(e) => e.stopPropagation()}>
-            <div style={styles.modalHeader}>
-              <h3 style={{ margin: 0, fontSize: 16, color: "#1e293b" }}>Attachment Preview</h3>
-              <button onClick={() => setPreviewImage(null)} style={styles.modalCloseBtn}>
-                ✕
-              </button>
-            </div>
-            <div style={styles.modalBody}>
-              {previewImage.match(/\.(jpg|jpeg|png|gif|webp)(\?.*)?$/i) ? (
-                /* eslint-disable-next-line @next/next/no-img-element */
-                <img src={previewImage} alt="Attachment" style={styles.modalImg} />
-              ) : previewImage.match(/\.pdf(\?.*)?$/i) ? (
-                <iframe src={previewImage} title="PDF attachment" style={{ width: "100%", height: "75vh", border: 0, borderRadius: 8 }} />
-              ) : (
-                <div style={{ textAlign: "center", padding: "40px 20px" }}>
-                  <p style={{ color: "#475569", marginBottom: 16 }}>File preview not available for this format.</p>
-                  <a
-                    href={previewImage}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{ ...styles.primaryBtn, textDecoration: "none" }}
-                  >
-                    Open in New Tab ↗
-                  </a>
-                </div>
-              )}
-            </div>
-          </div>
+      {/* ── Mobile action bar ── */}
+      <div className="fixed inset-x-0 bottom-0 z-40 border-t border-slate-200 bg-white/95 px-3 pb-[max(env(safe-area-inset-bottom),12px)] pt-3 backdrop-blur md:hidden">
+        <div className="grid grid-cols-3 gap-2">
+          <a href={exportUrl("pdf")} className="flex flex-col items-center gap-0.5 rounded-xl bg-slate-100 py-2 text-xs font-semibold text-slate-700 active:bg-slate-200">
+            <FiFileText className="h-5 w-5" /> PDF
+          </a>
+          <a href={exportUrl("xlsx")} className="flex flex-col items-center gap-0.5 rounded-xl bg-slate-100 py-2 text-xs font-semibold text-slate-700 active:bg-slate-200">
+            <FiDownload className="h-5 w-5" /> Excel
+          </a>
+          <button onClick={() => setShareOpen(true)} className="flex flex-col items-center gap-0.5 rounded-xl bg-indigo-600 py-2 text-xs font-semibold text-white active:bg-indigo-700">
+            <FiShare2 className="h-5 w-5" /> Share
+          </button>
         </div>
+        {filtersActive && <p className="mt-1.5 text-center text-[10px] text-slate-500">Downloads include your current filters</p>}
+      </div>
+
+      {filtersOpen && (
+        <FilterSheet
+          filters={filters}
+          facets={facets}
+          onChange={setFilters}
+          onClose={() => setFiltersOpen(false)}
+          resultCount={filtered.length}
+        />
+      )}
+      {shareOpen && (
+        <ShareSheet
+          title={title}
+          sectionLabel={`${section.label} · ${section.rangeLabel}`}
+          total={digest.expense.total}
+          count={digest.expense.count}
+          expiresAt={expiresAt}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
+      {preview && <PreviewModal url={preview} onClose={() => setPreview(null)} />}
+    </div>
+  );
+}
+
+// ─── Building blocks ──────────────────────────────────────────────────────────
+
+function LoadingState() {
+  return (
+    <div className="min-h-screen bg-slate-50 p-4">
+      <div className="mx-auto max-w-6xl animate-pulse space-y-4 pt-4">
+        <div className="h-12 rounded-2xl bg-slate-200" />
+        <div className="h-14 rounded-2xl bg-slate-200" />
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div className="col-span-2 h-36 rounded-2xl bg-slate-200" />
+          <div className="h-24 rounded-2xl bg-slate-200" />
+          <div className="h-24 rounded-2xl bg-slate-200" />
+        </div>
+        <div className="h-64 rounded-2xl bg-slate-200" />
+        <p className="text-center text-sm text-slate-500">Opening secure report…</p>
+      </div>
+    </div>
+  );
+}
+
+function StateCard({ icon, title, tone, children }: { icon: React.ReactNode; title: string; tone: "amber" | "red" | "slate"; children: React.ReactNode }) {
+  const tones = { amber: "bg-amber-50 text-amber-600", red: "bg-red-50 text-red-600", slate: "bg-slate-100 text-slate-500" };
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-50 p-4">
+      <div className="w-full max-w-md rounded-3xl bg-white p-8 text-center shadow-sm ring-1 ring-slate-200">
+        <div className={`mx-auto flex h-14 w-14 items-center justify-center rounded-2xl ${tones[tone]}`}>{icon}</div>
+        <h1 className="mt-4 text-xl font-bold text-slate-900">{title}</h1>
+        <div className="mt-2 text-sm leading-relaxed text-slate-600">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function StatusBar({ digest }: { digest: ReturnType<typeof summarizeRows> }) {
+  const parts = (["approved", "pending", "rejected"] as const).map((k) => ({ k, v: digest.expense[k].total }));
+  const whole = digest.expense.claimed.total;
+  if (!whole) return null;
+  return (
+    <div className="mt-4">
+      <div className="flex h-2.5 w-full gap-[2px] overflow-hidden rounded-full bg-slate-100" role="img"
+        aria-label={parts.map((p) => `${STATUS[p.k].label} ${pct(p.v, whole).toFixed(0)}%`).join(", ")}>
+        {parts.filter((p) => p.v > 0).map((p) => (
+          <div key={p.k} title={`${STATUS[p.k].label}: ${fmtINR(p.v)}`} style={{ width: `${pct(p.v, whole)}%`, background: STATUS[p.k].color }} />
+        ))}
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-600">
+        {parts.map((p) => {
+          const S = STATUS[p.k];
+          return (
+            <span key={p.k} className="inline-flex items-center gap-1">
+              <S.Icon className="h-3 w-3" style={{ color: S.color }} />
+              {S.label} {pct(p.v, whole).toFixed(0)}%
+            </span>
+          );
+        })}
+        <span className="text-slate-400">of {fmtINR(whole)} claimed</span>
+      </div>
+    </div>
+  );
+}
+
+function CashCard({ digest, cashPosition, filtersActive }: { digest: ReturnType<typeof summarizeRows>; cashPosition: CashPosition | null; filtersActive: boolean }) {
+  const [showUsers, setShowUsers] = useState(false);
+  const steps = cashPosition
+    ? [
+        { label: "Opening balance", value: cashPosition.opening, sign: "" },
+        { label: "Cash received", value: cashPosition.received, sign: "+" },
+        { label: "Cash spent", value: cashPosition.spent, sign: "−" },
+        { label: "Cash in hand", value: cashPosition.closing, sign: "=" },
+      ]
+    : [
+        { label: "Cash received", value: digest.cash.received.total, sign: "+" },
+        { label: "Cash spent", value: digest.cash.spent.total, sign: "−" },
+        { label: "Net cash flow", value: digest.cash.net, sign: "=" },
+      ];
+  return (
+    <section className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-bold">Cash statement</h2>
+          <p className="text-xs text-slate-500">
+            Credits received and debits booked in this period{filtersActive ? " (filtered — opening/closing balance hidden)" : ""}
+          </p>
+        </div>
+        {cashPosition && cashPosition.users.length > 0 && (
+          <button onClick={() => setShowUsers((s) => !s)} className="shrink-0 text-xs font-semibold text-indigo-600">
+            {showUsers ? "Hide" : "By employee"}
+          </button>
+        )}
+      </div>
+      <div className={`mt-3 grid gap-2 ${steps.length === 4 ? "grid-cols-2 lg:grid-cols-4" : "grid-cols-3"}`}>
+        {steps.map((s, i) => (
+          <div key={s.label} className={`rounded-xl p-3 ${i === steps.length - 1 ? "bg-indigo-50 ring-1 ring-indigo-100" : "bg-slate-50"}`}>
+            <div className="text-[11px] font-semibold text-slate-500">
+              {s.sign && <span className="mr-1 text-slate-400">{s.sign}</span>}
+              {s.label}
+            </div>
+            <div className={`mt-0.5 text-base font-bold sm:text-lg ${s.value < 0 ? "text-red-700" : "text-slate-900"}`}>{fmtINR(s.value)}</div>
+          </div>
+        ))}
+      </div>
+      {showUsers && cashPosition && (
+        <div className="-mx-4 mt-3 overflow-x-auto sm:mx-0">
+          <table className="w-full min-w-[520px] text-sm">
+            <thead>
+              <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                <th className="px-4 py-2">Employee</th>
+                <th className="px-4 py-2 text-right">Opening</th>
+                <th className="px-4 py-2 text-right">Received</th>
+                <th className="px-4 py-2 text-right">Spent</th>
+                <th className="px-4 py-2 text-right">In hand</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 tabular-nums">
+              {cashPosition.users.map((u) => (
+                <tr key={u.userId}>
+                  <td className="px-4 py-2 font-medium">{u.name}</td>
+                  <td className="px-4 py-2 text-right">{fmtINR(u.opening)}</td>
+                  <td className="px-4 py-2 text-right">{fmtINR(u.received)}</td>
+                  <td className="px-4 py-2 text-right">{fmtINR(u.spent)}</td>
+                  <td className={`px-4 py-2 text-right font-semibold ${u.closing < 0 ? "text-red-700" : ""}`}>{fmtINR(u.closing)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BreakdownCard({ title, subtitle, buckets, whole, selected, onToggle, labelFn = (k: string) => k }: {
+  title: string;
+  subtitle: string;
+  buckets: Bucket[];
+  whole: number;
+  selected: string[];
+  onToggle: (key: string) => void;
+  labelFn?: (key: string) => string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const list = expanded ? buckets : buckets.slice(0, 6);
+  const max = buckets[0]?.total || 0;
+  return (
+    <div className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-5">
+      <h2 className="text-base font-bold">{title}</h2>
+      <p className="text-xs text-slate-500">{subtitle} · tap to filter</p>
+      {buckets.length === 0 ? (
+        <p className="py-8 text-center text-sm text-slate-400">No expenses in this view</p>
+      ) : (
+        <ul className="mt-3 space-y-1">
+          {list.map((b) => {
+            const active = selected.includes(b.key);
+            return (
+              <li key={b.key}>
+                <button
+                  onClick={() => onToggle(b.key)}
+                  aria-pressed={active}
+                  className={`w-full rounded-xl px-2 py-2 text-left transition ${active ? "bg-indigo-50 ring-1 ring-indigo-200" : "hover:bg-slate-50"}`}
+                >
+                  <div className="flex items-baseline justify-between gap-3 text-sm">
+                    <span className="flex min-w-0 items-center gap-1.5 font-medium text-slate-800">
+                      {active && <FiCheck className="h-3.5 w-3.5 shrink-0 text-indigo-600" />}
+                      <span className="truncate">{labelFn(b.key)}</span>
+                      <span className="shrink-0 text-xs font-normal text-slate-400">{b.count}</span>
+                    </span>
+                    <span className="shrink-0 font-semibold tabular-nums text-slate-900">
+                      {fmtINR(b.total)}
+                      <span className="ml-1.5 text-xs font-normal text-slate-500">{pct(b.total, whole).toFixed(0)}%</span>
+                    </span>
+                  </div>
+                  <div className="mt-1.5 h-2 w-full rounded-full bg-slate-100">
+                    <div className="h-2 rounded-r-full" style={{ width: `${Math.max(2, pct(b.total, max))}%`, background: BAR }} />
+                  </div>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {buckets.length > 6 && (
+        <button onClick={() => setExpanded((e) => !e)} className="mt-2 text-xs font-semibold text-indigo-600">
+          {expanded ? "Show less" : `Show all ${buckets.length}`}
+        </button>
       )}
     </div>
   );
 }
 
-// ─── Inline Styles ────────────────────────────────────────────────────────────
+function TrendCard({ from, to, byDate }: { from: string; to: string; byDate: Bucket[] }) {
+  const days = daysBetween(from, to);
+  const map = new Map(byDate.map((b) => [b.key, b]));
+  const max = Math.max(0, ...byDate.map((b) => b.total));
+  const peak = byDate.reduce<Bucket | null>((m, b) => (!m || b.total > m.total ? b : m), null);
+  const labelEvery = days.length > 16 ? 5 : days.length > 8 ? 2 : 1;
+  if (days.length < 2) return null;
+  return (
+    <section className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-bold">Daily spend</h2>
+          <p className="text-xs text-slate-500">Expenses per day, excluding rejected</p>
+        </div>
+        {peak && (
+          <div className="text-right text-xs text-slate-500">
+            Highest day
+            <div className="text-sm font-semibold text-slate-900">{fmtINR(peak.total)} · {shortDay(peak.key)}</div>
+          </div>
+        )}
+      </div>
+      <div className="mt-4 flex h-36 items-end gap-[2px] border-b border-slate-200">
+        {days.map((day) => {
+          const b = map.get(day);
+          const h = max ? (b ? Math.max(3, (b.total / max) * 100) : 0) : 0;
+          return (
+            <div key={day} className="group relative flex h-full flex-1 items-end justify-center">
+              <div className="w-full max-w-[24px] rounded-t-[4px] transition-opacity group-hover:opacity-80" style={{ height: `${h}%`, background: BAR }} />
+              <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-1 hidden -translate-x-1/2 whitespace-nowrap rounded-lg bg-slate-900 px-2 py-1 text-[11px] text-white shadow group-hover:block">
+                {fmtDay(day)} · {b ? `${fmtINR(b.total)} · ${b.count}` : "no entries"}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="mt-1 flex gap-[2px]">
+        {days.map((day, i) => (
+          <div key={day} className="flex-1 text-center text-[10px] text-slate-400">
+            {i % labelEvery === 0 ? new Date(`${day}T00:00:00`).getDate() : ""}
+          </div>
+        ))}
+      </div>
+      <div className="mt-1 text-right text-[10px] text-slate-400">Scale up to {fmtCompactINR(max)}</div>
+    </section>
+  );
+}
 
-const styles: Record<string, React.CSSProperties> = {
-  page: {
-    minHeight: "100vh",
-    background: "#f8fafc",
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-    color: "#1e293b",
-  },
-  centerBox: {
-    minHeight: "100vh",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    background: "#f8fafc",
-    padding: 24,
-    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
-  },
-  spinner: {
-    width: 44,
-    height: 44,
-    border: "4px solid #e2e8f0",
-    borderTop: "4px solid #4f46e5",
-    borderRadius: "50%",
-    animation: "spin 0.8s linear infinite",
-  },
-  stateCard: {
-    background: "#fff",
-    borderRadius: 18,
-    padding: "36px 32px",
-    maxWidth: 460,
-    width: "100%",
-    textAlign: "center",
-    boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.08), 0 8px 10px -6px rgba(0, 0, 0, 0.04)",
-    border: "1px solid #e2e8f0",
-  },
-  stateTitle: {
-    fontSize: 22,
-    fontWeight: 800,
-    color: "#0f172a",
-    margin: "0 0 10px",
-  },
-  stateText: {
-    color: "#64748b",
-    fontSize: 14,
-    lineHeight: 1.6,
-    margin: 0,
-  },
-  timeTag: {
-    display: "inline-block",
-    marginTop: 14,
-    padding: "6px 14px",
-    background: "#fef3c7",
-    color: "#92400e",
-    borderRadius: 100,
-    fontSize: 12,
-    fontWeight: 600,
-  },
-  primaryBtn: {
-    display: "inline-block",
-    marginTop: 20,
-    padding: "10px 22px",
-    background: "#4f46e5",
-    color: "#fff",
-    border: "none",
-    borderRadius: 10,
-    fontSize: 14,
-    fontWeight: 600,
-    cursor: "pointer",
-  },
-  topHeader: {
-    background: "#ffffff",
-    borderBottom: "1px solid #e2e8f0",
-    padding: "14px 24px",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    flexWrap: "wrap",
-    gap: 14,
-    position: "sticky",
-    top: 0,
-    zIndex: 40,
-    boxShadow: "0 1px 3px rgba(0,0,0,0.03)",
-  },
-  headerLeft: {
-    display: "flex",
-    alignItems: "center",
-    gap: 14,
-  },
-  logoBadge: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    fontSize: 22,
-    color: "#fff",
-    flexShrink: 0,
-    boxShadow: "0 4px 6px -1px rgba(79, 70, 229, 0.2)",
-  },
-  reportTitle: {
-    margin: 0,
-    fontSize: 18,
-    fontWeight: 800,
-    color: "#0f172a",
-    letterSpacing: "-0.01em",
-  },
-  reportMeta: {
-    margin: "3px 0 0",
-    fontSize: 12,
-    color: "#64748b",
-  },
-  badge: {
-    display: "inline-block",
-    padding: "2px 8px",
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 700,
-    border: "1px solid",
-  },
-  headerActions: {
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  actionBtn: {
-    padding: "8px 14px",
-    border: "none",
-    borderRadius: 8,
-    fontSize: 12,
-    fontWeight: 600,
-    cursor: "pointer",
-    transition: "all 0.15s ease",
-  },
-  mainContainer: {
-    maxWidth: 1320,
-    margin: "0 auto",
-    padding: "24px 20px 60px",
-  },
-  kpiGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
-    gap: 16,
-    marginBottom: 20,
-  },
-  kpiCard: {
-    background: "#fff",
-    borderRadius: 14,
-    padding: "16px 20px",
-    boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
-    border: "1px solid #e2e8f0",
-  },
-  kpiLabel: {
-    fontSize: 11,
-    fontWeight: 700,
-    color: "#64748b",
-    textTransform: "uppercase",
-    letterSpacing: "0.05em",
-  },
-  kpiVal: {
-    fontSize: 24,
-    fontWeight: 800,
-    margin: "6px 0 2px",
-    fontVariantNumeric: "tabular-nums",
-  },
-  kpiSub: {
-    fontSize: 11,
-    color: "#94a3b8",
-  },
-  filterBar: {
-    display: "flex",
-    alignItems: "center",
-    gap: 10,
-    flexWrap: "wrap",
-    background: "#ffffff",
-    padding: "10px 16px",
-    borderRadius: 12,
-    border: "1px solid #e2e8f0",
-    marginBottom: 16,
-  },
-  searchInput: {
-    flex: "1 1 240px",
-    padding: "8px 14px",
-    borderRadius: 8,
-    border: "1px solid #cbd5e1",
-    fontSize: 13,
-    outline: "none",
-    background: "#f8fafc",
-  },
-  filterDropdown: {
-    padding: "8px 12px",
-    borderRadius: 8,
-    border: "1px solid #cbd5e1",
-    fontSize: 12,
-    background: "#f8fafc",
-    color: "#1e293b",
-    cursor: "pointer",
-  },
-  quickFilterPanel: {
-    background: "#ffffff",
-    padding: "14px 16px",
-    borderRadius: 12,
-    border: "1px solid #e2e8f0",
-    marginBottom: 18,
-    boxShadow: "0 1px 2px rgba(15,23,42,.03)",
-  },
-  filterGroup: {
-    marginBottom: 12,
-  },
-  filterLabel: {
-    fontSize: 11,
-    fontWeight: 800,
-    color: "#475569",
-    textTransform: "uppercase",
-    letterSpacing: ".05em",
-    marginBottom: 8,
-  },
-  chipRow: {
-    display: "flex",
-    flexWrap: "wrap",
-    gap: 7,
-  },
-  filterChip: {
-    padding: "7px 11px",
-    borderRadius: 8,
-    border: "1px solid #cbd5e1",
-    background: "#f8fafc",
-    color: "#475569",
-    fontSize: 12,
-    fontWeight: 650,
-    cursor: "pointer",
-    textTransform: "capitalize",
-  },
-  filterChipActive: {
-    background: "#eef2ff",
-    borderColor: "#818cf8",
-    color: "#4338ca",
-  },
-  advancedFilters: {
-    marginTop: 6,
-    paddingTop: 10,
-    borderTop: "1px solid #e2e8f0",
-  },
-  filterSummary: {
-    cursor: "pointer",
-    color: "#4f46e5",
-    fontSize: 12,
-    fontWeight: 750,
-    marginBottom: 12,
-  },
-  textBtn: {
-    border: 0,
-    background: "transparent",
-    color: "#4f46e5",
-    fontSize: 11,
-    fontWeight: 800,
-    cursor: "pointer",
-    padding: "2px 4px",
-  },
-  tabNav: {
-    display: "flex",
-    gap: 6,
-    borderBottom: "2px solid #e2e8f0",
-    marginBottom: 16,
-    overflowX: "auto",
-  },
-  tabBtn: {
-    padding: "10px 18px",
-    border: "none",
-    background: "transparent",
-    fontSize: 13,
-    fontWeight: 600,
-    color: "#64748b",
-    cursor: "pointer",
-    borderBottom: "2px solid transparent",
-    marginBottom: -2,
-    whiteSpace: "nowrap",
-  },
-  tabBtnActive: {
-    color: "#4f46e5",
-    borderBottomColor: "#4f46e5",
-    fontWeight: 700,
-  },
-  tableCard: {
-    background: "#ffffff",
-    borderRadius: 14,
-    border: "1px solid #e2e8f0",
-    overflow: "hidden",
-    boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
-  },
-  table: {
-    width: "100%",
-    borderCollapse: "collapse",
-    fontSize: 13,
-  },
-  tableHeadRow: {
-    background: "#f8fafc",
-  },
-  th: {
-    padding: "12px 14px",
-    textAlign: "left",
-    fontSize: 11,
-    fontWeight: 700,
-    color: "#64748b",
-    textTransform: "uppercase",
-    letterSpacing: "0.04em",
-    borderBottom: "1px solid #e2e8f0",
-    whiteSpace: "nowrap",
-  },
-  td: {
-    padding: "10px 14px",
-    borderBottom: "1px solid #f1f5f9",
-    verticalAlign: "middle",
-  },
-  trEven: {
-    background: "#ffffff",
-  },
-  trOdd: {
-    background: "#fafbfc",
-  },
-  tfootRow: {
-    background: "#f8fafc",
-    borderTop: "2px solid #e2e8f0",
-  },
-  categoryPill: {
-    display: "inline-block",
-    padding: "2px 8px",
-    background: "#f1f5f9",
-    color: "#334155",
-    borderRadius: 6,
-    fontSize: 11,
-    fontWeight: 600,
-    textTransform: "capitalize",
-  },
-  attachmentPill: {
-    display: "inline-flex",
-    alignItems: "center",
-    padding: "2px 6px",
-    background: "#eff6ff",
-    color: "#2563eb",
-    border: "1px solid #bfdbfe",
-    borderRadius: 6,
-    fontSize: 11,
-    cursor: "pointer",
-    fontWeight: 600,
-  },
-  paginationBar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
-    padding: "12px 16px",
-    borderTop: "1px solid #e2e8f0",
-    background: "#fafbfc",
-  },
-  pageBtn: {
-    padding: "6px 12px",
-    background: "#ffffff",
-    border: "1px solid #cbd5e1",
-    borderRadius: 6,
-    fontSize: 12,
-    fontWeight: 600,
-    color: "#334155",
-    cursor: "pointer",
-  },
-  pageText: {
-    fontSize: 12,
-    color: "#64748b",
-    margin: "0 8px",
-  },
-  analysisGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))",
-    gap: 14,
-  },
-  analysisCard: {
-    background: "#ffffff",
-    borderRadius: 12,
-    border: "1px solid #e2e8f0",
-    padding: "16px 18px",
-    boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
-  },
-  analysisButton: {
-    width: "100%",
-    textAlign: "left",
-    fontFamily: "inherit",
-    cursor: "pointer",
-    transition: "border-color .15s ease, box-shadow .15s ease, transform .15s ease",
-  },
-  analysisCardSelected: {
-    border: "2px solid #6366f1",
-    background: "#f5f3ff",
-    boxShadow: "0 0 0 3px rgba(99,102,241,.10)",
-  },
-  cardSelectionHint: {
-    marginTop: 10,
-    paddingTop: 9,
-    borderTop: "1px solid #e2e8f0",
-    color: "#6366f1",
-    fontSize: 11,
-    fontWeight: 700,
-  },
-  progressTrack: {
-    height: 7,
-    background: "#f1f5f9",
-    borderRadius: 100,
-    overflow: "hidden",
-  },
-  progressFill: {
-    height: "100%",
-    borderRadius: 100,
-    transition: "width 0.3s ease",
-  },
-  emptyNotice: {
-    textAlign: "center",
-    padding: "48px 20px",
-  },
-  pageFooter: {
-    marginTop: 40,
-    paddingTop: 20,
-    borderTop: "1px solid #e2e8f0",
-    textAlign: "center",
-    fontSize: 12,
-    color: "#64748b",
-  },
-  modalOverlay: {
-    position: "fixed",
-    inset: 0,
-    background: "rgba(15, 23, 42, 0.7)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    zIndex: 100,
-    padding: 20,
-  },
-  modalBox: {
-    background: "#ffffff",
-    borderRadius: 16,
-    maxWidth: 720,
-    width: "100%",
-    overflow: "hidden",
-    boxShadow: "0 20px 25px -5px rgba(0,0,0,0.2)",
-  },
-  modalHeader: {
-    padding: "14px 20px",
-    borderBottom: "1px solid #e2e8f0",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  modalCloseBtn: {
-    background: "none",
-    border: "none",
-    fontSize: 16,
-    cursor: "pointer",
-    color: "#64748b",
-  },
-  modalBody: {
-    padding: 16,
-    maxHeight: "80vh",
-    overflowY: "auto",
-    display: "flex",
-    justifyContent: "center",
-  },
-  modalImg: {
-    maxWidth: "100%",
-    maxHeight: "70vh",
-    objectFit: "contain",
-    borderRadius: 8,
-  },
-};
+function StatusPill({ status }: { status: keyof typeof STATUS }) {
+  const s = STATUS[status];
+  return (
+    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1 ${s.pill}`}>
+      <s.Icon className="h-3 w-3" style={{ color: s.color }} /> {s.label}
+    </span>
+  );
+}
+
+function TypeBadge({ type }: { type: string }) {
+  return type === "credit" ? (
+    <span className="rounded-full bg-sky-50 px-2 py-0.5 text-[11px] font-semibold text-sky-800 ring-1 ring-sky-200">Cash received</span>
+  ) : (
+    <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-semibold text-slate-700 ring-1 ring-slate-200">Cash spent</span>
+  );
+}
+
+function Attachments({ urls, onPreview }: { urls: string[]; onPreview: (u: string) => void }) {
+  if (!urls?.length) return <span className="text-slate-300">—</span>;
+  return (
+    <div className="flex flex-wrap justify-center gap-1">
+      {urls.slice(0, 4).map((u, i) => (
+        <button key={i} onClick={() => onPreview(u)} className="inline-flex items-center gap-0.5 rounded-md bg-indigo-50 px-1.5 py-0.5 text-[11px] font-semibold text-indigo-700 hover:bg-indigo-100">
+          <FiPaperclip className="h-3 w-3" />{i + 1}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function TransactionCard({ row, onPreview }: { row: ReportRow; onPreview: (u: string) => void }) {
+  const st = statusOf(row);
+  return (
+    <li className={`px-4 py-3 ${st === "rejected" ? "opacity-60" : ""}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-900">
+            {row.type === "expense" ? labelize(row.category) : <TypeBadge type={row.type} />}
+            {row.type === "expense" && <span className="ml-1.5 text-xs font-normal text-slate-400">{labelize(row.source)}</span>}
+          </div>
+          <div className="mt-0.5 text-xs text-slate-500">
+            {row.userName} · {fmtDay(row.date)}
+          </div>
+        </div>
+        <div className={`shrink-0 text-right text-base font-bold tabular-nums ${st === "rejected" ? "line-through" : ""}`}>
+          {row.type === "debit" ? "−" : row.type === "credit" ? "+" : ""}
+          {fmtINR(row.amount)}
+        </div>
+      </div>
+      {row.siteName && <div className="mt-1 truncate text-xs text-slate-600">📍 {row.siteName}</div>}
+      {(row.description || row.remarks) && <p className="mt-1 line-clamp-2 text-xs text-slate-500">{row.description || row.remarks}</p>}
+      {(st || row.attachments?.length > 0) && (
+        <div className="mt-2 flex items-center justify-between gap-2">
+          {st ? <StatusPill status={st} /> : <span />}
+          {row.attachments?.length > 0 && <Attachments urls={row.attachments} onPreview={onPreview} />}
+        </div>
+      )}
+    </li>
+  );
+}
+
+function ActiveFilters({ filters, onChange }: { filters: RowFilters; onChange: (f: RowFilters) => void }) {
+  const chips: { label: string; clear: () => void }[] = [];
+  if (filters.search) chips.push({ label: `“${filters.search}”`, clear: () => onChange({ ...filters, search: "" }) });
+  if (filters.type && filters.type !== "all") chips.push({ label: labelize(filters.type), clear: () => onChange({ ...filters, type: "all" }) });
+  if (filters.source && filters.source !== "all") chips.push({ label: labelize(filters.source), clear: () => onChange({ ...filters, source: "all" }) });
+  filters.statuses?.forEach((s) => chips.push({ label: labelize(s), clear: () => onChange({ ...filters, statuses: toggle(filters.statuses, s) }) }));
+  filters.users?.forEach((u) => chips.push({ label: u, clear: () => onChange({ ...filters, users: toggle(filters.users, u) }) }));
+  filters.categories?.forEach((c) => chips.push({ label: labelize(c), clear: () => onChange({ ...filters, categories: toggle(filters.categories, c) }) }));
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {chips.map((c, i) => (
+        <button key={i} onClick={c.clear} className="inline-flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-800 ring-1 ring-indigo-200">
+          {c.label} <FiX className="h-3 w-3" />
+        </button>
+      ))}
+      <button onClick={() => onChange(EMPTY_FILTERS)} className="px-1 text-xs font-semibold text-slate-500 hover:text-slate-800">
+        Clear all
+      </button>
+    </div>
+  );
+}
+
+function Sheet({ title, onClose, children, footer }: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/50 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onClick={(e) => e.stopPropagation()}
+        className="flex max-h-[88vh] w-full flex-col rounded-t-3xl bg-white shadow-xl sm:max-w-lg sm:rounded-3xl"
+      >
+        <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+          <h3 className="text-base font-bold">{title}</h3>
+          <button onClick={onClose} aria-label="Close" className="rounded-full p-1.5 text-slate-500 hover:bg-slate-100">
+            <FiX className="h-5 w-5" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-4">{children}</div>
+        {footer && <div className="border-t border-slate-100 px-5 py-3 pb-[max(env(safe-area-inset-bottom),12px)]">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+
+function ChipGroup({ label, options, selected, onToggle }: { label: string; options: { value: string; label: string }[]; selected: string[]; onToggle: (v: string) => void }) {
+  if (options.length === 0) return null;
+  return (
+    <div>
+      <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {options.map((o) => {
+          const active = selected.includes(o.value);
+          return (
+            <button key={o.value} onClick={() => onToggle(o.value)} aria-pressed={active}
+              className={`rounded-full px-3 py-1.5 text-sm font-medium ring-1 ${active ? "bg-indigo-600 text-white ring-indigo-600" : "bg-white text-slate-700 ring-slate-200 hover:bg-slate-50"}`}>
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function FilterSheet({ filters, facets, onChange, onClose, resultCount }: {
+  filters: RowFilters;
+  facets: { users: string[]; categories: string[]; sources: string[]; types: string[] };
+  onChange: (f: RowFilters) => void;
+  onClose: () => void;
+  resultCount: number;
+}) {
+  return (
+    <Sheet
+      title="Filter transactions"
+      onClose={onClose}
+      footer={
+        <div className="flex gap-2">
+          <button onClick={() => onChange(EMPTY_FILTERS)} className="flex-1 rounded-xl bg-slate-100 py-2.5 text-sm font-semibold text-slate-700">Reset</button>
+          <button onClick={onClose} className="flex-[2] rounded-xl bg-indigo-600 py-2.5 text-sm font-semibold text-white">Show {resultCount} result{resultCount === 1 ? "" : "s"}</button>
+        </div>
+      }
+    >
+      <div className="space-y-5">
+        <ChipGroup
+          label="Status"
+          options={(["approved", "pending", "rejected"] as const).map((s) => ({ value: s, label: STATUS[s].label }))}
+          selected={filters.statuses || []}
+          onToggle={(v) => onChange({ ...filters, statuses: toggle(filters.statuses, v) })}
+        />
+        {facets.sources.length > 1 && (
+          <ChipGroup
+            label="Expense type"
+            options={facets.sources.map((s) => ({ value: s, label: labelize(s) }))}
+            selected={filters.source && filters.source !== "all" ? [filters.source] : []}
+            onToggle={(v) => onChange({ ...filters, source: filters.source === v ? "all" : v })}
+          />
+        )}
+        <ChipGroup
+          label="Employee"
+          options={facets.users.map((u) => ({ value: u, label: u }))}
+          selected={filters.users || []}
+          onToggle={(v) => onChange({ ...filters, users: toggle(filters.users, v) })}
+        />
+        <ChipGroup
+          label="Category"
+          options={facets.categories.map((c) => ({ value: c, label: labelize(c) }))}
+          selected={filters.categories || []}
+          onToggle={(v) => onChange({ ...filters, categories: toggle(filters.categories, v) })}
+        />
+      </div>
+    </Sheet>
+  );
+}
+
+function ShareSheet({ title, sectionLabel, total, count, expiresAt, onClose }: {
+  title: string;
+  sectionLabel: string;
+  total: number;
+  count: number;
+  expiresAt: string | null;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const url = typeof window !== "undefined" ? window.location.href : "";
+  const expiry = expiresAt ? new Date(expiresAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "";
+  const message = `*${title}*\n${sectionLabel}\nTotal expenses: ${fmtINR(total)} (${count} entries)\n\nView report: ${url}${expiry ? `\nLink valid until ${expiry}` : ""}`;
+  const canNativeShare = typeof navigator !== "undefined" && typeof navigator.share === "function";
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      const el = document.createElement("textarea");
+      el.value = url;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand("copy");
+      el.remove();
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <Sheet title="Share this report" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="flex items-center gap-2 rounded-xl bg-slate-50 p-2 ring-1 ring-slate-200">
+          <FiLink className="ml-1 h-4 w-4 shrink-0 text-slate-400" />
+          <input readOnly value={url} onFocus={(e) => e.target.select()} className="min-w-0 flex-1 bg-transparent text-xs text-slate-600 outline-none" />
+          <button onClick={copy} className={`inline-flex shrink-0 items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold ${copied ? "bg-green-600 text-white" : "bg-indigo-600 text-white"}`}>
+            {copied ? <><FiCheck className="h-3.5 w-3.5" /> Copied</> : <><FiCopy className="h-3.5 w-3.5" /> Copy</>}
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          <a href={`https://wa.me/?text=${encodeURIComponent(message)}`} target="_blank" rel="noopener noreferrer"
+            className="flex items-center justify-center gap-2 rounded-xl bg-[#25d366] py-3 text-sm font-semibold text-white">
+            WhatsApp
+          </a>
+          <a href={`mailto:?subject=${encodeURIComponent(`${title} — ${sectionLabel}`)}&body=${encodeURIComponent(message.replace(/\*/g, ""))}`}
+            className="flex items-center justify-center gap-2 rounded-xl bg-slate-800 py-3 text-sm font-semibold text-white">
+            <FiMail className="h-4 w-4" /> Email
+          </a>
+          {canNativeShare && (
+            <button onClick={() => navigator.share({ title, text: `${title} — ${sectionLabel}`, url }).catch(() => {})}
+              className="col-span-2 flex items-center justify-center gap-2 rounded-xl bg-slate-100 py-3 text-sm font-semibold text-slate-800 sm:col-span-1">
+              <FiShare2 className="h-4 w-4" /> More apps
+            </button>
+          )}
+        </div>
+        <p className="text-xs leading-relaxed text-slate-500">
+          Anyone with this link can view the report{expiry ? ` until ${expiry}` : ""}. No CashWise login is needed — share it only with people who should see these figures.
+        </p>
+      </div>
+    </Sheet>
+  );
+}
+
+function PreviewModal({ url, onClose }: { url: string; onClose: () => void }) {
+  const isImage = /\.(jpe?g|png|gif|webp|avif)(\?.*)?$/i.test(url);
+  const isPdf = /\.pdf(\?.*)?$/i.test(url);
+  return (
+    <Sheet title="Attachment" onClose={onClose}>
+      <div className="flex flex-col items-center gap-3">
+        {isImage ? (
+          /* eslint-disable-next-line @next/next/no-img-element */
+          <img src={url} alt="Expense attachment" className="max-h-[60vh] w-auto rounded-xl object-contain" />
+        ) : isPdf ? (
+          <iframe src={url} title="PDF attachment" className="h-[60vh] w-full rounded-xl border-0" />
+        ) : (
+          <p className="py-6 text-sm text-slate-500">Preview isn’t available for this file type.</p>
+        )}
+        <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 text-sm font-semibold text-indigo-600">
+          Open in new tab <FiExternalLink className="h-4 w-4" />
+        </a>
+      </div>
+    </Sheet>
+  );
+}

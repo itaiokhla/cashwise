@@ -1,26 +1,25 @@
 /**
  * POST /api/reports/generate-now
  *
- * Admin-only endpoint to manually trigger a scheduled report.
- * Uses the SAME engine as the cron job — no duplicate logic.
+ * Admin-only endpoint to manually trigger a saved report schedule now.
+ * Uses the SAME pipeline as the cron job — no duplicate logic — and does
+ * not change the schedule's next-run state.
  *
  * Request body:
  *  scheduleId   - (required) ID of the ScheduledReport to execute
- *  sendEmail    - (optional, default true) whether to send the email
  *
  * Returns the share URL and execution summary.
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import mongoose from "mongoose";
 import DB from "@app/_database/db";
 import ScheduledReport from "@app/_model/scheduledReport.model";
-import { sendAutomatedExpenseReports } from "@app/_lib/autoExpenseReport";
-import type { ExpenseSource, ExpenseStatus } from "@app/_lib/reportEngine";
+import { resolveAppBaseUrl, runReport, scheduleToJob } from "@app/_lib/autoExpenseReport";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-
-(async () => await DB())();
+export const maxDuration = 60;
 
 function getAuthUser(req: NextRequest) {
   const header = req.headers.get("user");
@@ -41,13 +40,14 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}));
     const { scheduleId } = body;
 
-    if (!scheduleId) {
+    if (!scheduleId || !mongoose.Types.ObjectId.isValid(scheduleId)) {
       return NextResponse.json(
-        { type: "BAD_REQUEST", message: "scheduleId is required" },
+        { type: "BAD_REQUEST", message: "A valid scheduleId is required" },
         { status: 400 }
       );
     }
 
+    await DB();
     const schedule = await ScheduledReport.findById(scheduleId).lean();
     if (!schedule) {
       return NextResponse.json(
@@ -56,30 +56,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Build app base URL from request
-    const origin = new URL(req.url).origin;
-
-    const result = await sendAutomatedExpenseReports({
-      scheduleId: schedule._id.toString(),
-      scheduleName: schedule.name,
-      reportType: schedule.reportType as any,
-      frequency: schedule.frequency,
-      time: schedule.time,
-      period: schedule.reportPeriod as any,
-      timezone: schedule.timezone,
-      recipients: schedule.recipients,
+    const result = await runReport(scheduleToJob(schedule), {
       triggeredBy: "manual_generate",
-      filters: {
-        userIds: schedule.filters?.userIds || [],
-        expenseSources: (schedule.filters?.expenseSources || []) as ExpenseSource[],
-        categories: schedule.filters?.categories || [],
-        statuses: (schedule.filters?.statuses || []) as ExpenseStatus[],
-        includeCredit: schedule.filters?.includeCredit !== false,
-        includeDebit: schedule.filters?.includeDebit !== false,
-        visibleFields: schedule.filters?.visibleFields || [],
-        search: schedule.filters?.search || "",
-      },
-      appBaseUrl: origin,
+      appBaseUrl: resolveAppBaseUrl(new URL(req.url).origin),
     });
 
     return NextResponse.json({

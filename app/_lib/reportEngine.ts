@@ -14,6 +14,7 @@
  */
 
 import mongoose from "mongoose";
+import { DateTime } from "luxon";
 import DB from "@app/_database/db";
 import Users from "@app/_model/user.model";
 import OfficeExpense from "@app/_model/office.modal";
@@ -74,6 +75,8 @@ export interface ReportEngineFilters {
   sortOrder?: "asc" | "desc";
   page?: number;
   limit?: number;
+  /** Zone used to turn credit/debit timestamps into calendar days. Default Asia/Kolkata. */
+  timezone?: string;
 }
 
 export interface ReportEngineResult {
@@ -120,12 +123,29 @@ function makeStringDateFilter(from?: string, to?: string) {
   return f;
 }
 
-/** Date range filter for transactionDetails.createdAt stored as JS Date */
-function makeDateRangeFilter(from?: string, to?: string) {
+export const REPORT_TIMEZONE = process.env.AUTO_EXPENSE_REPORT_TIMEZONE || "Asia/Kolkata";
+
+function resolveZone(zone?: string): string {
+  const z = zone || REPORT_TIMEZONE;
+  return DateTime.now().setZone(z).isValid ? z : "Asia/Kolkata";
+}
+
+/**
+ * Date range filter for transactionDetails.createdAt stored as JS Date.
+ * Day boundaries are taken in the report timezone (not the server's, which
+ * is UTC on Vercel) so an IST transaction at 01:00 lands on the right day.
+ */
+function makeDateRangeFilter(from?: string, to?: string, zone?: string) {
+  const z = resolveZone(zone);
   const f: Record<string, Date> = {};
-  if (from) { const d = new Date(from); d.setHours(0, 0, 0, 0); f.$gte = d; }
-  if (to) { const d = new Date(to); d.setHours(23, 59, 59, 999); f.$lte = d; }
+  if (from) f.$gte = DateTime.fromISO(from, { zone: z }).startOf("day").toJSDate();
+  if (to) f.$lte = DateTime.fromISO(to, { zone: z }).endOf("day").toJSDate();
   return f;
+}
+
+/** Calendar day (YYYY-MM-DD) of a timestamp in the report timezone. */
+function localDate(d: Date, zone?: string): string {
+  return DateTime.fromJSDate(d).setZone(resolveZone(zone)).toISODate() ?? d.toISOString().split("T")[0];
 }
 
 function collectAttachments(item: Record<string, unknown>): string[] {
@@ -213,6 +233,9 @@ async function fetchExpenseRows(
           }
 
           rows.push({
+            // forward all raw item fields for detail views (spread first so
+            // the normalised fields below always win)
+            ...item,
             _id:         String((item._id ?? doc._id ?? "") as unknown),
             date:        docDate,
             type:        "expense",
@@ -220,17 +243,14 @@ async function fetchExpenseRows(
             userName:    createdBy.name || "Unknown",
             userId:      createdBy._id?.toString() || "",
             category,
-            siteName:    String(item.siteName ?? item.serviceProvider ?? ""),
-            amount:      Number(item.amount ?? 0),
-            description: String(item.description ?? item.todayWork ?? ""),
+            siteName:    String(item.siteName || item.serviceProvider || ""),
+            amount:      Number(item.amount ?? 0) || 0,
+            description: String(item.description || item.todayWork || ""),
             remarks:     String(item.remarks ?? ""),
-            status:      String(item.status ?? "pending"),
+            status:      String(item.status || "pending"),
             attachments: collectAttachments(item),
-            createdAt:   new Date(doc.createdAt as Date ?? Date.now()).toISOString(),
-            // forward all raw item fields for detail views
-            ...item,
-            // ensure typed fields are not overridden by raw spread
-            _id_raw: String((item._id ?? doc._id ?? "") as unknown),
+            createdAt:   new Date((item.createdAt ?? doc.createdAt ?? Date.now()) as Date).toISOString(),
+            _id_raw:     String((item._id ?? doc._id ?? "") as unknown),
           });
         }
       }
@@ -247,7 +267,7 @@ async function fetchTransactionRows(
   userObjectIds: mongoose.Types.ObjectId[],
   txType: "credit" | "debit"
 ): Promise<NormalisedRow[]> {
-  const dateFilter = makeDateRangeFilter(filters.fromDate, filters.toDate);
+  const dateFilter = makeDateRangeFilter(filters.fromDate, filters.toDate, filters.timezone);
   const hasDateFilter = !!(dateFilter.$gte || dateFilter.$lte);
 
   let users: unknown[];
@@ -289,7 +309,7 @@ async function fetchTransactionRows(
 
         rows.push({
           _id:         String(detail._id ?? new mongoose.Types.ObjectId()),
-          date:        createdAt.toISOString().split("T")[0],
+          date:        localDate(createdAt, filters.timezone),
           type:        txType,
           source:      txType,
           userName:    String(user.name ?? "Unknown"),
@@ -455,4 +475,100 @@ export async function runReportEngine(filters: ReportEngineFilters): Promise<Rep
   const { data: rows, pagination } = paginate(sorted, page, limit);
 
   return { rows, allRows: sorted, summary, pagination };
+}
+
+// ─── Cash Position (opening / closing balance) ────────────────────────────────
+
+export interface CashPositionResult {
+  opening: number;
+  received: number;
+  spent: number;
+  closing: number;
+  users: {
+    userId: string;
+    name: string;
+    opening: number;
+    received: number;
+    spent: number;
+    closing: number;
+  }[];
+}
+
+/**
+ * Cash-in-hand statement for a date window, per user and in total:
+ *   opening  = all credit − all debit before `fromDate`
+ *   received = credit inside the window
+ *   spent    = debit inside the window
+ *   closing  = opening + received − spent
+ * Uses the same credit − debit rule as the account and day-balance screens.
+ */
+export async function computeCashPosition(params: {
+  userIds?: string[];
+  fromDate: string;
+  toDate: string;
+  timezone?: string;
+}): Promise<CashPositionResult> {
+  await DB();
+
+  const range = makeDateRangeFilter(params.fromDate, params.toDate, params.timezone);
+  const start = range.$gte;
+  const end = range.$lte;
+
+  const query: Record<string, unknown> = {};
+  if (params.userIds && params.userIds.length > 0) {
+    query._id = { $in: toObjectIds(params.userIds) };
+  }
+
+  const users = (await Users.find(query, { _id: 1, name: 1, credit: 1, debit: 1 }).lean()) as unknown as Record<string, unknown>[];
+
+  const round2 = (n: number) => Math.round(n * 100) / 100;
+  const result: CashPositionResult = { opening: 0, received: 0, spent: 0, closing: 0, users: [] };
+
+  for (const user of users) {
+    let opening = 0;
+    let received = 0;
+    let spent = 0;
+
+    for (const txType of ["credit", "debit"] as const) {
+      const sign = txType === "credit" ? 1 : -1;
+      const entries = (user[txType] as Record<string, unknown>[] | undefined) ?? [];
+      for (const entry of entries) {
+        const details = (entry.transactionDetails as Record<string, unknown>[] | undefined) ?? [];
+        for (const detail of details) {
+          if (!detail.createdAt) continue;
+          const at = new Date(detail.createdAt as string | Date);
+          const money = Number(detail.money ?? 0) || 0;
+          if (start && at < start) {
+            opening += sign * money;
+          } else if (!end || at <= end) {
+            if (txType === "credit") received += money;
+            else spent += money;
+          }
+        }
+      }
+    }
+
+    if (opening === 0 && received === 0 && spent === 0) continue;
+
+    const closing = opening + received - spent;
+    result.users.push({
+      userId: String((user._id as { toString(): string }).toString()),
+      name: String(user.name ?? "Unknown"),
+      opening: round2(opening),
+      received: round2(received),
+      spent: round2(spent),
+      closing: round2(closing),
+    });
+    result.opening += opening;
+    result.received += received;
+    result.spent += spent;
+    result.closing += closing;
+  }
+
+  result.users.sort((a, b) => b.closing - a.closing || a.name.localeCompare(b.name));
+  result.opening = round2(result.opening);
+  result.received = round2(result.received);
+  result.spent = round2(result.spent);
+  result.closing = round2(result.closing);
+  return result;
 }

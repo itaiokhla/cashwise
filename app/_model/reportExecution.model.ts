@@ -17,6 +17,9 @@ export interface IReportExecution extends Document {
   shareLinkId?: mongoose.Types.ObjectId | null; // link to ReportShareLink document
   shareUrl?: string | null;                      // fully formed public share URL
   shareExpiresAt?: Date | null;                 // copy of share link expiry for quick reference
+  slotAt?: Date | null;                         // scheduled time this run delivered (null for manual)
+  sections?: { key: string; label: string; from: string; to: string; total: number; count: number }[];
+  emailMessageId?: string | null;
   durationMs: number;
   executedAt: Date;
   triggeredBy: "cron" | "manual_test" | "scheduler" | "manual_generate";
@@ -62,6 +65,22 @@ const reportExecutionSchema = new Schema<IReportExecution>(
     },
     shareUrl: { type: String, default: null },
     shareExpiresAt: { type: Date, default: null },
+    slotAt: { type: Date, default: null },
+    sections: {
+      type: [
+        {
+          _id: false,
+          key: String,
+          label: String,
+          from: String,
+          to: String,
+          total: Number,
+          count: Number,
+        },
+      ],
+      default: [],
+    },
+    emailMessageId: { type: String, default: null },
     durationMs: { type: Number, default: 0 },
     executedAt: { type: Date, default: Date.now, index: true },
     triggeredBy: {

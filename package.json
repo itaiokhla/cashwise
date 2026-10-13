@@ -2,6 +2,9 @@
   "name": "cashwise",
   "version": "0.2.0",
   "private": true,
+  "engines": {
+    "node": "20.x || 22.x || 24.x"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,7 +12,8 @@
     "lint": "next lint",
     "seed": "node scripts/run-seed.js",
     "scheduler": "node scripts/scheduler.js",
-    "deploy": "serverless --aws-profile default"
+    "deploy": "serverless --aws-profile default",
+    "seed:reports": "node scripts/run-seed-report-data.js"
   },
   "dependencies": {
     "@emotion/react": "^11.13.5",

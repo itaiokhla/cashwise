@@ -2,6 +2,7 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Loader2, MapPin, Calendar, User, CreditCard, FileText, DollarSign } from 'lucide-react';
 import { useGetSearchQuery } from '@/app/_api_query/global.search.api';
+import { usePathname } from 'next/navigation';
 
 
 
@@ -180,7 +181,17 @@ const SearchResultItem: React.FC<any> = ({ item }) => {
   );
 };
 
-export default function EnhancedGlobalSearch() {
+// Public pages (shared report links) are opened by people outside CashWise;
+// the internal search bar would only call protected APIs there.
+const PUBLIC_PREFIXES = ['/shared-report'];
+
+export default function Header() {
+  const pathname = usePathname();
+  if (PUBLIC_PREFIXES.some((p) => pathname?.startsWith(p))) return null;
+  return <EnhancedGlobalSearch />;
+}
+
+function EnhancedGlobalSearch() {
   const [query, setQuery] = useState<string>('');
   const [debouncedQuery, setDebouncedQuery] = useState<string>('');
   const [isOpen, setIsOpen] = useState<boolean>(false);
