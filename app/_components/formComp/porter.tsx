@@ -677,6 +677,7 @@ export default function Porter({ closeModal }: expenseFormProps) {
                   <div className="flex items-center justify-between">
                     <label className="block font-semibold">Amount ₹</label>
 
+                    {/* [EXPENSE-LIMIT DISABLED]
                     {budget.status === "over" && !limitOTPVerified && (
                       <div className="flex items-center gap-2">
                         {!otpSent ? (
@@ -750,6 +751,7 @@ export default function Porter({ closeModal }: expenseFormProps) {
                         )}
                       </div>
                     )}
+                    */}
 
                     {limitHook.limit && (
                       <span className="text-xs text-gray-400">
@@ -762,7 +764,7 @@ export default function Porter({ closeModal }: expenseFormProps) {
                     placeholder="₹"
                     type="number"
                     {...register("amount", { required: "Amount required" })}
-                    className={`w-full p-2 border-b-2 outline-none transition-colors ${budget.status === "over" ? "border-red-400" :
+                    className={`w-full p-2 border-b-2 outline-none transition-colors ${/* [EXPENSE-LIMIT DISABLED] budget.status === "over" ? "border-red-400" : */
                       budget.status === "warn" ? "border-orange-400" :
                         "border-gray-200 focus:border-purple-500"
                       }`}
@@ -771,24 +773,30 @@ export default function Porter({ closeModal }: expenseFormProps) {
 
                   {errors.amount && <p className="text-red-500 text-sm">{errors.amount.message}</p>}
 
+                  {/* [EXPENSE-LIMIT DISABLED]
                   {budget.status === "over" && !limitOTPVerified && (
                     <p className="text-red-500 text-xs flex items-center gap-1">
                       <FiAlertTriangle /> Amount exceeds limit. OTP verification required.
                     </p>
                   )}
+                  */}
 
+                  {/* [EXPENSE-LIMIT DISABLED]
                   {budget.status === "over" && limitOTPVerified && (
                     <p className="text-green-600 text-xs flex items-center gap-1">
                       <FiCheckCircle /> Limit override approved via OTP
                     </p>
                   )}
+                  */}
                 </motion.div>
+                {/* [EXPENSE-LIMIT DISABLED]
                 {budget.status === "over" && !limitOTPVerified && (
 
                   <p className="text-red-300">Your amount is greater than limit , Contact to the admin for more information <a href="tel:9891402128" className="text-blue-500 underline">
                     9891402128
                   </a></p>
                 )}
+                */}
                 {/* porter Description */}
                 <motion.div
                   className="space-y-2"
@@ -884,7 +892,7 @@ export default function Porter({ closeModal }: expenseFormProps) {
                           whileHover={{ scale: 1.05 }}
                           whileTap={{ scale: 0.95 }}
                           type="submit"
-                          disabled={isLoading || (budget.status === "over" && !limitOTPVerified)}
+                          disabled={isLoading /* [EXPENSE-LIMIT DISABLED] || (budget.status === "over" && !limitOTPVerified) */}
                           className="bg-purple-600 text-white px-8 py-2 rounded-md font-semibold hover:bg-purple-700 relative disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           {isLoading ? (
@@ -897,7 +905,7 @@ export default function Porter({ closeModal }: expenseFormProps) {
                             </motion.div>
                           ) : (
                             <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-                              {budget.status === "over" && !limitOTPVerified ? "Verify OTP to Submit" : "Submit"}
+                              {"Submit" /* [EXPENSE-LIMIT DISABLED] budget.status === "over" && !limitOTPVerified ? "Verify OTP to Submit" : "Submit" */}
                             </motion.span>
                           )}
                         </motion.button>

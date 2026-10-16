@@ -12,7 +12,7 @@ import { expenseMessageAlert } from "@app/_helpers/expense.messageAlert";
 import Users from "@app/_model/user.model";
 import { createJournalVoucher } from "@services/journalVoucher.service";
 import { createPaymentVoucher } from "@services/paymentVoucher.service";
-import { validateExpenseLimit } from "@app/_lib/validateExpenseLimit.server";
+// [EXPENSE-LIMIT DISABLED] import { validateExpenseLimit } from "@app/_lib/validateExpenseLimit.server";
 import { validateExpenseAttachments } from "@app/_lib/validateExpenseAttachment";
 
 // Initialize database connection
@@ -61,20 +61,21 @@ export async function POST(
 const schemaName = body.get("schema") as string;
 
     // ── 1. Validate against expense limit ─────────────────────────────────
-    const limitCheck = await validateExpenseLimit(userId, schemaName, "food", amount);
+    // [EXPENSE-LIMIT DISABLED] Expense limit check is turned off for now. Uncomment the block below (and the import above) to re-enable it.
+    // const limitCheck = await validateExpenseLimit(userId, schemaName, "food", amount);
 
-    if (!limitCheck.valid &&  body.get('expenselimitVerified')==='false') {
-      return NextResponse.json(
-        {
-          type: "LIMIT_EXCEEDED",
-          message: "Expense exceeds your allowed limits",
-          errors: limitCheck.errors,
-          breakdown: limitCheck.breakdown,
-          total: limitCheck.totalBreakdown,
-        },
-        { status: 400 }
-      );
-    }
+    // if (!limitCheck.valid &&  body.get('expenselimitVerified')==='false') {
+    //   return NextResponse.json(
+    //     {
+    //       type: "LIMIT_EXCEEDED",
+    //       message: "Expense exceeds your allowed limits",
+    //       errors: limitCheck.errors,
+    //       breakdown: limitCheck.breakdown,
+    //       total: limitCheck.totalBreakdown,
+    //     },
+    //     { status: 400 }
+    //   );
+    // }
 
     const foodData = {
       siteName: body.get("siteName"),
