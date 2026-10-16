@@ -36,12 +36,19 @@ const calculateTotal = (items: any[]) => {
   return items?.reduce((sum, item) => sum + (item.amount || 0), 0) || 0;
 };
 
+// Calendar day as picked ("YYYY-MM-DD" in the browser's time zone). toISOString()
+// converts to UTC first, which in India (UTC+5:30) turns midnight into the previous day.
+const toLocalDay = (value: Date | string) => {
+  const d = new Date(value);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 const getDefaultDates = () => {
   const today = new Date();
   const defaultFrom = new Date();
   return {
-    from: defaultFrom.toISOString().split("T")[0],
-    to: today.toISOString().split("T")[0],
+    from: toLocalDay(defaultFrom),
+    to: toLocalDay(today),
   };
 };
 
@@ -131,7 +138,7 @@ export default function Page() {
   const [name, setName] = React.useState("");
   const [userExpenseData, setUserExpenseData] = React.useState<any>(null);
   const [fromDateState, setFromDate] = React.useState(getDefaultDates().from);
-  const [toDateState, setToDate] = React.useState(getDefaultDates().from);
+  const [toDateState, setToDate] = React.useState(getDefaultDates().to);
   useEffect(() => {
     const fetchData = async () => {
       if (!fromDateState || !toDateState) return; // prevent premature fetch
@@ -175,8 +182,8 @@ export default function Page() {
   }, [fromDateState, toDateState, name, expenseType]);
 
   const onApplyTransactionDetailsFilters = async (filters: any) => {
-    setFromDate(filters.fromDate?.toISOString().split("T")[0] || "");
-    setToDate(filters.toDate?.toISOString().split("T")[0] || "");
+    setFromDate(filters.fromDate ? toLocalDay(filters.fromDate) : "");
+    setToDate(filters.toDate ? toLocalDay(filters.toDate) : "");
     setName(filters.name);
     setExpenseType(filters.expenseType);
   };
@@ -303,14 +310,14 @@ export default function Page() {
                         "porter",
                         "cartage",
                         "rider",
-                        "daily Wages",
+                        "dailyWages",
                         "transport",
                         "maintenance",
                         "labour",
                         "contractor",
                         "other",
                       ].map((category, idx) => {
-                        const total = calculateTotal(expense[category]);
+                        const total = calculateTotal(expense[category] || expense[category.replace(/\s+/g, '')]);
                         return (
                           <td
                             key={idx}
@@ -336,7 +343,7 @@ export default function Page() {
                                       name: expense?.user?.name,
                                       expenseType: expense?.type,
                                       field: category,
-                                      categoryData: expense[category],
+                                      categoryData: expense[category] || expense[category.replace(/\s+/g, '')],
                                     })
                                   }
                                 />

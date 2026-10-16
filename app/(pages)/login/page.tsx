@@ -14,6 +14,7 @@ import client from "@createRequest";
 import { useAppDispatch, useAppSelector } from "@redux/redux.hooks";
 import { selectUser, setUser } from "@redux/users/userSlice";
 import { getCookie } from "cookies-next";
+import { normalizePhone } from "@app/_helpers/phone";
 
 const Login = () => {
   const {
@@ -21,6 +22,7 @@ const Login = () => {
     register,
     formState: { errors },
     getValues,
+    setValue,
   } = useForm();
 
   const dispatch = useAppDispatch();
@@ -78,9 +80,17 @@ const Login = () => {
     setResendTimer(120);
   };
 
+  // Back to the "enter phone number" step
+  const resetOtp = () => {
+    setOtpSent(false);
+    setResendTimer(0);
+    setCanResend(false);
+    setValue("otp", "");
+  };
+
   const handleSendOtp = async () => {
-    const phone = getValues("phone");
-    if (!phone || phone.toString().length !== 10) {
+    const phone = normalizePhone(getValues("phone"));
+    if (!phone) {
       toast.error("Please enter a valid 10-digit phone number");
       return;
     }
@@ -100,7 +110,7 @@ const Login = () => {
   };
 
   const handleResendOtp = async () => {
-    const phone = getValues("phone");
+    const phone = normalizePhone(getValues("phone"));
     try {
       setIsLoading(true);
       const res = await client.put("/login", { phone });
@@ -116,6 +126,8 @@ const Login = () => {
   };
 
   const onSubmit = async (data: any) => {
+    // No OTP to verify yet; send one instead of submitting without it
+    if (loginMethod === "phone" && !otpSent) return handleSendOtp();
     try {
       setIsLoading(true);
       let response: any;
@@ -126,8 +138,8 @@ const Login = () => {
         });
       } else {
         response = await client.post("/login", {
-          phone: data.phone,
-          otp: data.otp,
+          phone: normalizePhone(data.phone),
+          otp: data.otp?.trim(),
         });
       }
       if (response.status === 200) {
@@ -618,7 +630,7 @@ const Login = () => {
             </button>
             <button
               type="button"
-              onClick={() => { setLoginMethod("phone"); setOtpSent(false); }}
+              onClick={() => { setLoginMethod("phone"); resetOtp(); }}
               className={`toggle-btn ${loginMethod === "phone" ? "active" : "inactive"}`}
             >
               📱 Phone
@@ -679,15 +691,18 @@ const Login = () => {
                           <HiOutlinePhone className="input-icon" />
                           <input
                             type="tel"
+                            inputMode="numeric"
+                            autoComplete="tel"
                             className="field-input"
                             placeholder="10-digit number"
-                            maxLength={10}
-                            {...register("phone", { required: true, minLength: 10, maxLength: 10 })}
+                            maxLength={16}
+                            readOnly={otpSent}
+                            {...register("phone", { required: true, validate: (v) => !!normalizePhone(v) })}
                           />
                         </div>
                         {errors.phone && <span className="error-msg">Valid phone number required</span>}
                       </div>
-                      {!otpSent && (
+                      {!otpSent ? (
                         <button
                           type="button"
                           className="otp-send-btn"
@@ -695,6 +710,15 @@ const Login = () => {
                           disabled={isLoading}
                         >
                           {isLoading ? "..." : "Send OTP"}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="otp-send-btn"
+                          onClick={resetOtp}
+                          disabled={isLoading}
+                        >
+                          Change
                         </button>
                       )}
                     </div>
@@ -710,6 +734,8 @@ const Login = () => {
                         </span>
                         <input
                           type="text"
+                          inputMode="numeric"
+                          autoComplete="one-time-code"
                           className="field-input"
                           placeholder="Enter OTP"
                           maxLength={6}
@@ -741,7 +767,11 @@ const Login = () => {
               )}
             </div>
 
-            <button type="submit" className="submit-btn" disabled={isLoading}>
+            <button
+              type="submit"
+              className="submit-btn"
+              disabled={isLoading || (loginMethod === "phone" && !otpSent)}
+            >
               {isLoading ? (
                 <span className="processing">
                   <span className="spinner" />

@@ -34,13 +34,20 @@ const calculateTotal = (items: any[]) => {
   return items?.reduce((sum, item) => sum + (item.amount || 0), 0) || 0;
 };
 
+// Calendar day as picked ("YYYY-MM-DD" in the browser's time zone). toISOString()
+// converts to UTC first, which in India (UTC+5:30) turns midnight into the previous day.
+const toLocalDay = (value: Date | string) => {
+  const d = new Date(value);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
 const getDefaultDates = () => {
   const today = new Date();
   const defaultFrom = new Date();
   defaultFrom.setDate(today.getDate() - 7);
   return {
-    from: defaultFrom.toISOString().split("T")[0],
-    to: today.toISOString().split("T")[0],
+    from: toLocalDay(defaultFrom),
+    to: toLocalDay(today),
   };
 };
 
@@ -172,8 +179,8 @@ export default function ToPayDashboard() {
   }, [fromDateState, toDateState, name, expenseType]);
 
   const onApplyTransactionDetailsFilters = async (filters: any) => {
-    setFromDate(filters.fromDate?.toISOString().split("T")[0] || "");
-    setToDate(filters.toDate?.toISOString().split("T")[0] || "");
+    setFromDate(filters.fromDate ? toLocalDay(filters.fromDate) : "");
+    setToDate(filters.toDate ? toLocalDay(filters.toDate) : "");
     setName(filters.name);
     setExpenseType(filters.expenseType);
   };

@@ -6,7 +6,7 @@ import ToPayExpense from "@app/_model/toPay.modal";
 import { NextRequest, NextResponse } from "next/server";
 import { DateTime } from "luxon";
 import Users from "@app/_model/user.model";
-import PreviousMap_ from "@node_modules/postcss/lib/previous-map";
+import mongoose from "mongoose";
 import DataWithDate from "@app/_model/datawithdate.modal";
 
 (async function initializeDB() {
@@ -183,19 +183,40 @@ export async function GET(req: NextRequest) {
       return u;
     });
 
-    const query: any = {
-      createdBy: { $in: filterUserIds },
-      date: { $gte: startDate, $lte: endDate },
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      query.createdAt = dateFilter;
-    }
+    const startJSDate = DateTime.fromISO(startDate, { zone: "Asia/Kolkata" }).startOf('day').toJSDate();
+    const endJSDate = DateTime.fromISO(endDate, { zone: "Asia/Kolkata" }).endOf('day').toJSDate();
 
-    //filter for expenseType
+    const allFilterUserIds = [
+      ...filterUserIds,
+      ...filterUserIds
+        .filter((id: string) => mongoose.Types.ObjectId.isValid(id))
+        .map((id: string) => new mongoose.Types.ObjectId(id))
+    ];
+
+    const dateConditions: any[] = [
+      { date: { $gte: startJSDate, $lte: endJSDate } },
+      { date: { $gte: startDate, $lte: endDate } },
+      { createdAt: { $gte: startJSDate, $lte: endJSDate } }
+    ];
+
+    const query: any = {
+      createdBy: { $in: allFilterUserIds },
+    };
+
     if (formTypeParamsArray.length > 0) {
-      query.$or = formTypeParamsArray.map((formType: string) => ({
+      const formTypeOr = formTypeParamsArray.map((formType: string) => ({
         [formType]: { $exists: true, $ne: [] },
       }));
+      query.$and = [
+        { $or: dateConditions },
+        { $or: formTypeOr }
+      ];
+    } else {
+      query.$or = dateConditions;
+    }
+
+    if (Object.keys(dateFilter).length > 0) {
+      query.createdAt = dateFilter;
     }
 
     let projection: any = { createdBy: 1, date: 1, createdAt: 1, updatedAt: 1 };
@@ -209,7 +230,7 @@ export async function GET(req: NextRequest) {
       const allExpenseFields = [
         "conveyance", "cartage", "courier", "dailyWages", "food",
         "hotel", "labour", "loading", "maintenance", "other",
-        "porter", "purchase", "rider", "tea", "transport"
+        "porter", "purchase", "rider", "tea", "transport", "contractor"
       ];
 
       allExpenseFields.forEach((field) => {
@@ -246,8 +267,11 @@ export async function GET(req: NextRequest) {
       key: keyof (typeof usersResult)[0],
       type: string
     ) => {
-      data.forEach((item) => {
-        const user = usersMap.get(item?.createdBy?._id.toString());
+      data.forEach((item: any) => {
+        const creatorId =
+          item?.createdBy?._id?.toString() ||
+          item?.createdBy?.toString();
+        const user = usersMap.get(creatorId);
         if (!user) return;
 
         // If status filter is applied

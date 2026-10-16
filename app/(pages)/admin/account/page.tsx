@@ -78,30 +78,13 @@ export default function AdminAccount() {
     return expenseDetails.reduce((sum, expense) => {
       if (!expense) return sum;
 
-      const categories = [
-        "cartage",
-        "conveyance",
-        "courier",
-        "dailyWages",
-        "food",
-        "hotel",
-        "labour",
-        "loading",
-        "maintenance",
-        "other",
-        "porter",
-        "purchase",
-        "rider",
-        "tea",
-        "transport",
-      ];
       return (
         sum +
-        categories.reduce((catSum, category) => {
-          if (Array.isArray(expense[category])) {
+        Object.keys(expense).reduce((catSum, key) => {
+          if (Array.isArray(expense[key])) {
             return (
               catSum +
-              expense[category].reduce(
+              expense[key].reduce(
                 (itemSum: number, item: any) => itemSum + (item?.amount || 0),
                 0
               )

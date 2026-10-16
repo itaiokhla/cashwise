@@ -207,7 +207,7 @@ const OtherSchema = new Schema({
 //  TravelExpense schema
 const TravelExpenseSchema = new Schema(
   {
-    date: { type: String, required: [true, "Date is required!"] },
+    date: { type: Schema.Types.Mixed, required: [true, "Date is required!"] },
     conveyance: { type: [ConveyanceSchema], default: [] },
     purchase: { type: [PurchaseSchema], default: [] },
     food: { type: [FoodSchema], default: [] },
@@ -224,7 +224,7 @@ const TravelExpenseSchema = new Schema(
     maintenance: { type: [MaintenanceSchema], default: [] },
     other: { type: [OtherSchema], default: [] },
     createdBy: {
-      type: Schema.Types.ObjectId,
+      type: Schema.Types.Mixed,
       ref: "Users",
       required: [true, "Created by user is required!"],
     },

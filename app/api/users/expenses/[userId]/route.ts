@@ -35,20 +35,60 @@ import ToPayExpense from "@app/_model/toPay.modal";
             DateTime.now().toFormat('yyyy-MM-dd');
 
             const basePipeline = [
+                {
+                    $addFields: {
+                        expenseDay: {
+                            $switch: {
+                                branches: [
+                                    {
+                                        case: { $eq: [{ $type: "$date" }, "date"] },
+                                        then: { $dateToString: { date: "$date", format: "%Y-%m-%d", timezone: "Asia/Kolkata" } },
+                                    },
+                                    {
+                                        case: {
+                                            $and: [
+                                                { $eq: [{ $type: "$date" }, "string"] },
+                                                { $regexMatch: { input: "$date", regex: "^\\d{4}-\\d{2}-\\d{2}" } },
+                                            ],
+                                        },
+                                        then: { $substrCP: ["$date", 0, 10] },
+                                    },
+                                    {
+                                        case: { $eq: [{ $type: "$date" }, "string"] },
+                                        then: {
+                                            $dateToString: {
+                                                date: { $dateFromString: { dateString: "$date", onError: null, onNull: null } },
+                                                format: "%Y-%m-%d",
+                                                timezone: "Asia/Kolkata",
+                                            },
+                                        },
+                                    },
+                                ],
+                                default: {
+                                    $dateToString: { date: "$createdAt", format: "%Y-%m-%d", timezone: "Asia/Kolkata" }
+                                },
+                            },
+                        },
+                    },
+                },
                 { 
                     $match: { 
-                        date: { 
+                        expenseDay: { 
                             $gte: startDate, 
                             $lte: endDate 
-                        } ,
-                        createdBy: new mongoose.Types.ObjectId(userId)
+                        },
+                        $expr: {
+                            $eq: [{ $toString: '$createdBy' }, userId]
+                        }
                     } 
                 },
                 {
                     $lookup: {
                         from: 'users',
-                        localField: 'createdBy',
-                        foreignField: '_id',
+                        let: { creatorId: { $toString: '$createdBy' } },
+                        pipeline: [
+                            { $match: { $expr: { $eq: [{ $toString: '$_id' }, '$$creatorId'] } } }
+                        ],
                         as: 'user'
                     }
                 },
@@ -57,6 +97,7 @@ import ToPayExpense from "@app/_model/toPay.modal";
     
             const projection = {
                 $project: {
+                    expenseDay: 0,
                     'user.password': 0,
                     'user.otp': 0,
                     'user.otpExpiration': 0

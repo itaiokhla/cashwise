@@ -8,24 +8,40 @@ import { cookies } from "next/headers";
 import Users from "@app/_model/user.model";
 // import otpGenerator  from 'otp-generator'
 import { otpAlert } from "@app/_helpers/otpAlert";
+import { normalizePhone } from "@app/_helpers/phone";
 import { DateTime } from "luxon";
+import { randomInt } from "crypto";
 
 // Initialize database connection
 (async function initializeDB() {
   await DB();
 })();
 // otp generate function
-const createOtp = () => Math.floor(100000 + Math.random() * 900000);
+const createOtp = () => randomInt(100000, 1000000);
 
 // Registration function
 export async function POST(req: Request) {
   try {
     // Parse the request body
     const { email, password, phone, otp } = await req.json();
+    // Every login must be verified: OTP for phone, password for email
+    if (phone ? !otp : !password) {
+      return NextResponse.json(
+        { message: phone ? "OTP is required!" : "Password is required!" },
+        { status: 400 }
+      );
+    }
     let user: any;
     if (phone) {
+      const phoneNumber = normalizePhone(phone);
+      if (!phoneNumber) {
+        return NextResponse.json(
+          { message: "Enter a valid 10-digit phone number!" },
+          { status: 400 }
+        );
+      }
       user = await Users.findOne(
-        { phone },
+        { phone: Number(phoneNumber) },
         { credit: 0, debit: 0, expense: 0 }
       );
     } else {
@@ -37,13 +53,17 @@ export async function POST(req: Request) {
     // Check if the user exists
     if (!user) {
       return NextResponse.json(
-        { message: "Enter Valid Email / Account not exist!" },
+        {
+          message: phone
+            ? "Enter Valid Phone / Account not exist!"
+            : "Enter Valid Email / Account not exist!",
+        },
         { status: 404 }
       );
     }
     // password checking
     if (password) {
-      if (!bcrypt.compareSync(password, user.password)) {
+      if (!user.password || !bcrypt.compareSync(password, user.password)) {
         return NextResponse.json(
           { message: "Enter Valid Password!" },
           { status: 404 }
@@ -54,7 +74,8 @@ export async function POST(req: Request) {
       const currentTime = DateTime.now().setZone("Asia/Kolkata");
 
       if (
-        user.otp !== Number(otp) ||
+        user.otp !== Number(String(otp).trim()) ||
+        !user.otpExpiration ||
         currentTime > DateTime.fromJSDate(user.otpExpiration)
       ) {
         return NextResponse.json(
@@ -62,6 +83,11 @@ export async function POST(req: Request) {
           { status: 404 }
         );
       }
+      // One-time: the same OTP can't be used to log in again
+      await Users.updateOne(
+        { _id: user._id },
+        { $unset: { otp: 1, otpExpiration: 1 } }
+      );
     }
     const payload = {
       _id: user._id,
@@ -120,7 +146,14 @@ export async function POST(req: Request) {
 export async function PUT(req: NextRequest) {
   try {
     const { phone } = await req.json();
-    const user = await Users.findOne({ phone });
+    const phoneNumber = normalizePhone(phone);
+    if (!phoneNumber) {
+      return NextResponse.json(
+        { message: "Enter a valid 10-digit phone number!" },
+        { status: 400 }
+      );
+    }
+    const user = await Users.findOne({ phone: Number(phoneNumber) });
 
     if (!user) {
       return NextResponse.json(
@@ -137,7 +170,12 @@ export async function PUT(req: NextRequest) {
     (user as any).otp = otp;
     (user as any).otpExpiration = expirationTime;
     await user.save();
-    await otpAlert(otp, phone);
+    if ((await otpAlert(otp, phoneNumber)) !== 200) {
+      return NextResponse.json(
+        { message: "Could not send OTP SMS, please try again!" },
+        { status: 502 }
+      );
+    }
     return NextResponse.json(
       { message: "OTP Send to Phone!" },
       { status: 200 }

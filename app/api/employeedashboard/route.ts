@@ -23,14 +23,75 @@ export async function GET(req: NextRequest) {
 
         let expenseFilter: any = {};
 
-        if (fromDate && !toDate) {
-            expenseFilter.date = { $gte: DateTime.fromISO(fromDate).setZone('Asia/Kolkata').startOf('day').toISODate() };
+        if (fromDate || toDate) {
+            const IST = 'Asia/Kolkata';
+            let startJSDate: Date | null = null;
+            let endJSDate: Date | null = null;
+            let startDayStr: string | null = null;
+            let endDayStr: string | null = null;
+
+            if (fromDate) {
+                const dt = DateTime.fromISO(fromDate, { zone: IST });
+                if (dt.isValid) {
+                    startJSDate = dt.startOf('day').toJSDate();
+                    startDayStr = dt.toISODate();
+                }
+            }
+
+            if (toDate) {
+                const dt = DateTime.fromISO(toDate, { zone: IST });
+                if (dt.isValid) {
+                    endJSDate = dt.endOf('day').toJSDate();
+                    endDayStr = dt.toISODate();
+                }
+            }
+
+            const dateConditions: any[] = [];
+
+            // BSON Date query condition
+            const dateObjCondition: any = {};
+            if (startJSDate) dateObjCondition.$gte = startJSDate;
+            if (endJSDate) dateObjCondition.$lte = endJSDate;
+            if (Object.keys(dateObjCondition).length > 0) {
+                dateConditions.push({ date: dateObjCondition });
+                dateConditions.push({ createdAt: dateObjCondition });
+            }
+
+            // String date query condition ("YYYY-MM-DD")
+            const dateStrCondition: any = {};
+            if (startDayStr) dateStrCondition.$gte = startDayStr;
+            if (endDayStr) dateStrCondition.$lte = endDayStr;
+            if (Object.keys(dateStrCondition).length > 0) {
+                dateConditions.push({ date: dateStrCondition });
+            }
+
+            if (dateConditions.length > 0) {
+                expenseFilter.$or = dateConditions;
+            }
         }
-        if (!fromDate && toDate) {
-            expenseFilter.date = { $lte: DateTime.fromISO(toDate).setZone('Asia/Kolkata').startOf('day').toISODate() };
-        }
-        if (fromDate && toDate) {
-            expenseFilter.date = { $gte: DateTime.fromISO(fromDate).setZone('Asia/Kolkata').startOf('day').toISODate(), $lte: DateTime.fromISO(toDate).setZone('Asia/Kolkata').startOf('day').toISODate() };
+
+        if (userId) {
+            try {
+                const user: any = await Users.findById(userId).lean();
+                if (user && user.role === 'employee') {
+                    const userOr = [
+                        { createdBy: userId },
+                        { createdBy: new mongoose.Types.ObjectId(userId) }
+                    ];
+                    if (expenseFilter.$or) {
+                        expenseFilter = {
+                            $and: [
+                                { $or: expenseFilter.$or },
+                                { $or: userOr }
+                            ]
+                        };
+                    } else {
+                        expenseFilter.$or = userOr;
+                    }
+                }
+            } catch (e) {
+                console.error("Error checking user role in employeedashboard:", e);
+            }
         }
 
         let officeExpenses: any = [];
