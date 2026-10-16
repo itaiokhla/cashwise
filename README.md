@@ -56,16 +56,24 @@ some point within its scheduled hour.
 which is within Hobby's limit of 100 once-a-day jobs and gives an hourly check. Every check sends each
 schedule's most recent slot that has passed and was not delivered yet, exactly once:
 
-- an email scheduled for 7:00 PM IST arrives between 7:00 and ~8:00 PM on Hobby;
 - report dates always come from the scheduled slot, so a late check still reports the right day;
 - missed checks are caught up (one email for the latest slot, never a burst);
 - duplicate/overlapping checks are harmless (atomic lock + one-delivery-per-slot key);
 - failures retry every ~10 minutes, up to 3 attempts per slot, and are shown in Settings.
 
-**Minute-accurate delivery** (optional): either upgrade to Vercel Pro and change one entry to
-`"*/5 * * * *"`, or point a free external cron (e.g. cron-job.org) at
-`https://<your-domain>/api/cron/expense-reports` every 5 minutes with the header
-`Authorization: Bearer <CRON_SECRET>`. Both can run together with Vercel Cron safely.
+**On-time delivery on Hobby (Vercel Queues timers).** Because Hobby runs each hourly job at a random
+minute, the hourly check alone delivered a 7:00 PM report anywhere up to ~1.5 hours late. Each schedule's
+next run is therefore also armed as a delayed [Vercel Queues](https://vercel.com/docs/queues) message
+(`app/_lib/reportTimers.ts`) that becomes visible at the exact minute and is handled by the private
+consumer `/api/queues/report-timer` (registered under `functions` in `vercel.json`). Timers are armed
+when a schedule is saved, after every hourly check and after every timer run (next day's slot, retries),
+so emails arrive within about a minute of the scheduled time. The hourly cron stays as the safety net.
+
+- No setup needed: Queues is available on every plan (Hobby includes 1M operations/month; this uses a few
+  thousand) and authenticates automatically on Vercel.
+- Only active on Vercel; locally `npm run scheduler` checks every minute instead.
+- Set `REPORT_PRECISE_TIMERS=off` to disable the timers and fall back to the hourly check only.
+- Set `APP_URL` to your production domain so links in timer-sent emails use it.
 
 ### Deploying to Vercel
 

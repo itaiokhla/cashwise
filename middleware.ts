@@ -10,6 +10,7 @@ const PUBLIC_PATHS = new Set([
   "/api/forgot-password",
   "/api/refresh-token",
   "/api/cron/expense-reports",
+  "/api/queues/report-timer",
 ]);
 
 const PUBLIC_PATH_PATTERNS = [

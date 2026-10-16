@@ -444,6 +444,7 @@ function SchedulerHealth({ scheduler, env, activeCount, onRefresh }: {
     "vercel-cron": "Vercel Cron",
     external: "external scheduler",
     "local-scheduler": "local scheduler",
+    "queue-timer": "on-time delivery timer",
   };
 
   const problems: string[] = [];
@@ -496,10 +497,8 @@ function SchedulerHealth({ scheduler, env, activeCount, onRefresh }: {
                 Every report is sent <strong>once, at or after its scheduled time</strong>, and always covers the dates it promises — even if the check runs late.
               </p>
               <p>
-                On Vercel’s free (Hobby) plan the check runs once an hour, so an email scheduled for 7:00 PM arrives between 7:00 and about 8:00 PM.
-                For delivery within a minute, upgrade to Vercel Pro or point a free uptime/cron service (e.g. cron-job.org) at
-                <code className="mx-1 rounded bg-white px-1 py-0.5 text-[11px] ring-1 ring-slate-200">/api/cron/expense-reports</code>
-                every 5 minutes with the header <code className="rounded bg-white px-1 py-0.5 text-[11px] ring-1 ring-slate-200">Authorization: Bearer &lt;CRON_SECRET&gt;</code>.
+                On Vercel each report’s next run is set as a timer that fires at the exact minute (e.g. 7:00 PM), so emails normally arrive within a minute of the scheduled time.
+                An hourly check also runs as a safety net and sends anything a timer missed.
               </p>
             </div>
           )}

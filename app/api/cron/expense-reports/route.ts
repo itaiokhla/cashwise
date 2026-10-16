@@ -13,6 +13,10 @@
  *    header or `x-cron-secret: $CRON_SECRET`.
  *  - scripts/scheduler.js during local development.
  *
+ * Hobby fires each hourly job at a random minute of its hour, so after every
+ * tick the upcoming slots are also armed as delayed Vercel Queues messages
+ * (see @app/_lib/reportTimers) that deliver at the exact configured minute.
+ *
  * Every tick is idempotent: a slot is delivered at most once no matter how
  * many callers fire, and missed ticks are caught up on the next one.
  */
@@ -20,6 +24,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { timingSafeEqual } from "crypto";
 import { dispatchDueReports, resolveAppBaseUrl } from "@app/_lib/autoExpenseReport";
+import { armReportTimers } from "@app/_lib/reportTimers";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -63,6 +68,8 @@ async function handle(request: NextRequest) {
       appBaseUrl: resolveAppBaseUrl(new URL(request.url).origin),
       source: tickSource(request),
     });
+    // Never throws; on failure the next hourly tick still delivers.
+    const timers = await armReportTimers();
 
     return NextResponse.json({
       type: "SUCCESS",
@@ -75,6 +82,7 @@ async function handle(request: NextRequest) {
         skippedCount: summary.skipped,
         deferredCount: summary.deferred,
         durationMs: summary.durationMs,
+        timersArmed: timers.armed,
       },
       results: summary.results,
     });

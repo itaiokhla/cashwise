@@ -10,12 +10,13 @@
  * DELETE — delete schedule (?id=)
  */
 
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import mongoose from "mongoose";
 import { DateTime } from "luxon";
 import DB from "@app/_database/db";
 import ScheduledReport from "@app/_model/scheduledReport.model";
 import SchedulerStatus, { SCHEDULER_STATUS_ID } from "@app/_model/schedulerStatus.model";
+import { armReportTimers, reportTimersEnabled } from "@app/_lib/reportTimers";
 import {
   computeNextRun,
   latestSlotAtOrBefore,
@@ -158,6 +159,7 @@ export async function GET(req: NextRequest) {
       emailConfigured: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS),
       cronSecretConfigured: !!process.env.CRON_SECRET,
       onVercel: !!process.env.VERCEL,
+      preciseTimers: reportTimersEnabled(),
     });
   } catch (error: any) {
     return NextResponse.json({ type: "ERROR", message: error?.message }, { status: 500 });
@@ -185,6 +187,8 @@ export async function POST(req: NextRequest) {
       createdBy: authUser._id,
       updatedBy: authUser._id,
     });
+    // Deliver at the exact time even if it is due before the next hourly cron tick.
+    after(() => armReportTimers({ scheduleIds: [String(doc._id)] }));
 
     return NextResponse.json({
       type: "SUCCESS",
@@ -244,6 +248,7 @@ export async function PUT(req: NextRequest) {
     if (!updated) {
       return NextResponse.json({ type: "NOT_FOUND", message: "Schedule not found" }, { status: 404 });
     }
+    after(() => armReportTimers({ scheduleIds: [String(updated._id)] }));
 
     return NextResponse.json({
       type: "SUCCESS",

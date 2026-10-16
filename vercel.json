@@ -1,5 +1,17 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "app/api/queues/report-timer/route.ts": {
+      "experimentalTriggers": [
+        {
+          "type": "queue/v2beta",
+          "topic": "report-timers",
+          "retryAfterSeconds": 60,
+          "maxDeliveries": 5
+        }
+      ]
+    }
+  },
   "crons": [
     {
       "path": "/api/cron/expense-reports",
