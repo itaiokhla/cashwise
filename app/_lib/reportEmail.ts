@@ -106,6 +106,54 @@ function sectionHtml(section: ReportSection, index: number) {
     ? `<div style="font-family:${FONT};font-size:13px;color:${C.muted};background:${C.soft};border:1px dashed ${C.line};border-radius:10px;padding:14px;text-align:center;margin-top:8px;">No entries were recorded for this period.</div>`
     : "";
 
+  let cashPositionTable = "";
+  if (cp && cp.users && cp.users.length > 0) {
+    const userRows = cp.users
+      .map((u) => {
+        const closingColor = u.closing < 0 ? "#dc2626" : u.closing > 0 ? "#16a34a" : C.ink;
+        return `<tr>
+          <td style="padding:7px 8px;font-family:${FONT};font-size:12px;color:${C.ink};border-bottom:1px solid ${C.line};font-weight:600;">${esc(u.name)}</td>
+          <td style="padding:7px 8px;font-family:${FONT};font-size:12px;color:${C.muted};border-bottom:1px solid ${C.line};text-align:right;">${esc(fmtINR(u.opening))}</td>
+          <td style="padding:7px 8px;font-family:${FONT};font-size:12px;color:#0891b2;border-bottom:1px solid ${C.line};text-align:right;">+${esc(fmtINR(u.received))}</td>
+          <td style="padding:7px 8px;font-family:${FONT};font-size:12px;color:#d97706;border-bottom:1px solid ${C.line};text-align:right;">−${esc(fmtINR(u.spent))}</td>
+          <td style="padding:7px 8px;font-family:${FONT};font-size:12px;color:${closingColor};border-bottom:1px solid ${C.line};text-align:right;font-weight:700;">${esc(fmtINR(u.closing))}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const totalClosingColor = cp.closing < 0 ? "#dc2626" : C.brand;
+
+    cashPositionTable = `<div style="font-family:${FONT};font-size:11px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;color:${C.muted};margin:16px 0 6px;">
+        Remaining Balance / Cash in Hand (All Users)
+      </div>
+      <div style="background:#ffffff;border:1px solid ${C.line};border-radius:10px;overflow:hidden;margin-bottom:12px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+          <thead>
+            <tr style="background:${C.soft};">
+              <th style="padding:8px;font-family:${FONT};font-size:11px;font-weight:700;color:${C.muted};text-align:left;text-transform:uppercase;letter-spacing:.3px;">User</th>
+              <th style="padding:8px;font-family:${FONT};font-size:11px;font-weight:700;color:${C.muted};text-align:right;text-transform:uppercase;letter-spacing:.3px;">Opening</th>
+              <th style="padding:8px;font-family:${FONT};font-size:11px;font-weight:700;color:${C.muted};text-align:right;text-transform:uppercase;letter-spacing:.3px;">Received</th>
+              <th style="padding:8px;font-family:${FONT};font-size:11px;font-weight:700;color:${C.muted};text-align:right;text-transform:uppercase;letter-spacing:.3px;">Spent</th>
+              <th style="padding:8px;font-family:${FONT};font-size:11px;font-weight:700;color:${C.muted};text-align:right;text-transform:uppercase;letter-spacing:.3px;">Remaining</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${userRows}
+          </tbody>
+          <tfoot>
+            <tr style="background:${C.soft};font-weight:700;">
+              <td style="padding:9px 8px;font-family:${FONT};font-size:12px;color:${C.ink};font-weight:700;">Total</td>
+              <td style="padding:9px 8px;font-family:${FONT};font-size:12px;color:${C.muted};text-align:right;font-weight:700;">${esc(fmtINR(cp.opening))}</td>
+              <td style="padding:9px 8px;font-family:${FONT};font-size:12px;color:#0891b2;text-align:right;font-weight:700;">+${esc(fmtINR(cp.received))}</td>
+              <td style="padding:9px 8px;font-family:${FONT};font-size:12px;color:#d97706;text-align:right;font-weight:700;">−${esc(fmtINR(cp.spent))}</td>
+              <td style="padding:9px 8px;font-family:${FONT};font-size:13px;color:${totalClosingColor};text-align:right;font-weight:800;">${esc(fmtINR(cp.closing))}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>`;
+  }
+
+
   return `<tr><td style="padding:${index === 0 ? "4px" : "22px"} 24px 0;" class="cw-pad">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"${index > 0 ? ` style="border-top:1px solid ${C.line};"` : ""}>
       <tr><td style="padding-top:${index > 0 ? "18px" : "0"};font-family:${FONT};">
@@ -121,6 +169,7 @@ function sectionHtml(section: ReportSection, index: number) {
       ${stat("Rejected", fmtINR(e.rejected.total), `${e.rejected.count} not counted`, "#d03b3b")}
     </tr></table>
     ${cashRow}
+    ${cashPositionTable}
     ${empty}
     ${bars("Top categories", e.byCategory, e.total, "#2a78d6", labelize, index === 0 ? 5 : 3)}
     ${bars("Top employees", e.byUser, e.total, "#2a78d6", (k) => k, index === 0 ? 5 : 3)}
@@ -221,7 +270,15 @@ export function buildReportEmailText(p: ReportEmailParams): string {
     lines.push(`  Rejected: ${fmtINR(e.rejected.total)} (${e.rejected.count}, not counted)`);
     if (s.digest.cash.received.count || s.digest.cash.spent.count || s.cashPosition) {
       lines.push(`  Cash received: ${fmtINR(s.digest.cash.received.total)} · Cash spent: ${fmtINR(s.digest.cash.spent.total)}`);
-      if (s.cashPosition) lines.push(`  Cash in hand: ${fmtINR(s.cashPosition.opening)} → ${fmtINR(s.cashPosition.closing)}`);
+      if (s.cashPosition) {
+        lines.push(`  Cash in hand: ${fmtINR(s.cashPosition.opening)} → ${fmtINR(s.cashPosition.closing)}`);
+        if (s.cashPosition.users?.length) {
+          lines.push(`  Remaining Balance by User:`);
+          for (const u of s.cashPosition.users) {
+            lines.push(`    - ${u.name}: Opening ${fmtINR(u.opening)} | Received +${fmtINR(u.received)} | Spent −${fmtINR(u.spent)} | Remaining: ${fmtINR(u.closing)}`);
+          }
+        }
+      }
     }
     const topCats = e.byCategory.slice(0, 3).map((b) => `${labelize(b.key)} ${fmtINR(b.total)}`).join(", ");
     if (topCats) lines.push(`  Top categories: ${topCats}`);

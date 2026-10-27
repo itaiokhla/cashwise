@@ -148,6 +148,24 @@ function localDate(d: Date, zone?: string): string {
   return DateTime.fromJSDate(d).setZone(resolveZone(zone)).toISODate() ?? d.toISOString().split("T")[0];
 }
 
+function normalizeDate(val: any, fallbackDate?: any, zone?: string): string {
+  if (!val && fallbackDate) val = fallbackDate;
+  if (!val) return "";
+  const z = resolveZone(zone);
+  if (val instanceof Date && !isNaN(val.getTime())) {
+    return DateTime.fromJSDate(val).setZone(z).toISODate() || "";
+  }
+  const s = String(val).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const dt = DateTime.fromISO(s, { zone: z });
+  if (dt.isValid) return dt.toISODate() || "";
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return DateTime.fromJSDate(d).setZone(z).toISODate() || "";
+  }
+  return s.length >= 10 ? s.slice(0, 10) : s;
+}
+
 function collectAttachments(item: Record<string, unknown>): string[] {
   const urls: string[] = [];
   for (const key of ["locationFiles", "paymentFiles", "invoiceFiles", "imageUrl"]) {
@@ -184,9 +202,60 @@ async function fetchExpenseRows(
       ? filters.categories
       : [...ALL_EXPENSE_CATEGORIES];
 
-  const stringDateFilter = makeStringDateFilter(filters.fromDate, filters.toDate);
-  const baseQuery: Record<string, unknown> = { createdBy: { $in: userObjectIds } };
-  if (stringDateFilter.$gte || stringDateFilter.$lte) baseQuery.date = stringDateFilter;
+  const allUsers = (await Users.find({}, { _id: 1, name: 1, phone: 1, role: 1 }).lean()) as unknown as Record<string, unknown>[];
+  const usersMap = new Map<string, any>();
+  allUsers.forEach((u: any) => {
+    usersMap.set(u._id.toString(), u);
+  });
+
+  const isUserFilterActive = filters.userIds && filters.userIds.length > 0;
+  const targetUserIds = filters.userIds || [];
+  const andClauses: any[] = [];
+
+  if (isUserFilterActive) {
+    const allTargetKeys = [...userObjectIds, ...targetUserIds];
+    andClauses.push({
+      $or: [
+        { createdBy: { $in: allTargetKeys } },
+        { "createdBy._id": { $in: allTargetKeys } },
+      ],
+    });
+  }
+
+  const zone = resolveZone(filters.timezone);
+  if (filters.fromDate || filters.toDate) {
+    const fromDay = filters.fromDate;
+    const toDay = filters.toDate;
+    const startJSDate = fromDay
+      ? DateTime.fromISO(fromDay, { zone }).startOf("day").toJSDate()
+      : new Date(0);
+    const endJSDate = toDay
+      ? DateTime.fromISO(toDay, { zone }).endOf("day").toJSDate()
+      : new Date(8640000000000000);
+
+    const dateConditions: any[] = [
+      { date: { $gte: startJSDate, $lte: endJSDate } },
+      { createdAt: { $gte: startJSDate, $lte: endJSDate } },
+    ];
+
+    if (fromDay && toDay) {
+      dateConditions.push(
+        { date: { $gte: fromDay, $lte: toDay } },
+        { date: { $gte: fromDay, $lte: `${toDay}T23:59:59.999Z` } }
+      );
+    } else if (fromDay) {
+      dateConditions.push({ date: { $gte: fromDay } });
+    } else if (toDay) {
+      dateConditions.push(
+        { date: { $lte: toDay } },
+        { date: { $lte: `${toDay}T23:59:59.999Z` } }
+      );
+    }
+
+    andClauses.push({ $or: dateConditions });
+  }
+
+  const baseQuery: Record<string, unknown> = andClauses.length > 0 ? { $and: andClauses } : {};
 
   const rows: NormalisedRow[] = [];
 
@@ -209,8 +278,22 @@ async function fetchExpenseRows(
     }
 
     for (const doc of docs as Record<string, unknown>[]) {
-      const createdBy = (doc.createdBy ?? {}) as { _id?: { toString(): string }; name?: string };
-      const docDate = String(doc.date ?? "");
+      const docDate = normalizeDate((doc as any).date, (doc as any).createdAt, filters.timezone);
+      if (filters.fromDate && docDate && docDate < filters.fromDate) continue;
+      if (filters.toDate && docDate && docDate > filters.toDate) continue;
+
+      const rawCreator = (doc as any).createdBy;
+      const creatorId =
+        (typeof rawCreator === "object" && rawCreator?._id ? rawCreator._id.toString() : null) ||
+        (rawCreator ? rawCreator.toString() : "");
+
+      const user = usersMap.get(creatorId);
+      const userName = user?.name || (typeof rawCreator === "object" && rawCreator?.name) || "Unknown";
+      const userId = user?._id?.toString() || creatorId;
+
+      if (isUserFilterActive && !targetUserIds.includes(userId)) {
+        continue;
+      }
 
       for (const category of categoriesToScan) {
         const items = doc[category];
@@ -240,8 +323,8 @@ async function fetchExpenseRows(
             date:        docDate,
             type:        "expense",
             source:      src,
-            userName:    createdBy.name || "Unknown",
-            userId:      createdBy._id?.toString() || "",
+            userName,
+            userId,
             category,
             siteName:    String(item.siteName || item.serviceProvider || ""),
             amount:      Number(item.amount ?? 0) || 0,
@@ -270,10 +353,18 @@ async function fetchTransactionRows(
   const dateFilter = makeDateRangeFilter(filters.fromDate, filters.toDate, filters.timezone);
   const hasDateFilter = !!(dateFilter.$gte || dateFilter.$lte);
 
+  const isUserFilterActive = filters.userIds && filters.userIds.length > 0;
+  const targetUserIds = filters.userIds || [];
+  const userQuery: any = {};
+  if (isUserFilterActive) {
+    const allTargetKeys = [...userObjectIds, ...targetUserIds];
+    userQuery._id = { $in: allTargetKeys };
+  }
+
   let users: unknown[];
   try {
     users = await Users.find(
-      { _id: { $in: userObjectIds } },
+      userQuery,
       { _id: 1, name: 1, phone: 1, [txType]: 1 }
     ).lean();
   } catch (err) {
@@ -292,7 +383,8 @@ async function fetchTransactionRows(
       for (const detail of details) {
         // Date filter on createdAt
         if (hasDateFilter) {
-          const cat = detail.createdAt ? new Date(detail.createdAt as string | Date) : null;
+          const catRaw = detail.createdAt || (detail as any).updatedAt || (detail as any).date;
+          const cat = catRaw ? new Date(catRaw as string | Date) : null;
           if (!cat) continue;
           if (dateFilter.$gte && cat < dateFilter.$gte) continue;
           if (dateFilter.$lte && cat > dateFilter.$lte) continue;
@@ -516,7 +608,8 @@ export async function computeCashPosition(params: {
 
   const query: Record<string, unknown> = {};
   if (params.userIds && params.userIds.length > 0) {
-    query._id = { $in: toObjectIds(params.userIds) };
+    const objIds = toObjectIds(params.userIds);
+    query._id = { $in: [...objIds, ...params.userIds] };
   }
 
   const users = (await Users.find(query, { _id: 1, name: 1, credit: 1, debit: 1 }).lean()) as unknown as Record<string, unknown>[];
@@ -535,8 +628,10 @@ export async function computeCashPosition(params: {
       for (const entry of entries) {
         const details = (entry.transactionDetails as Record<string, unknown>[] | undefined) ?? [];
         for (const detail of details) {
-          if (!detail.createdAt) continue;
-          const at = new Date(detail.createdAt as string | Date);
+          const atRaw = detail.createdAt || (detail as any).updatedAt || (detail as any).date;
+          if (!atRaw) continue;
+          const at = new Date(atRaw as string | Date);
+          if (isNaN(at.getTime())) continue;
           const money = Number(detail.money ?? 0) || 0;
           if (start && at < start) {
             opening += sign * money;
@@ -547,8 +642,6 @@ export async function computeCashPosition(params: {
         }
       }
     }
-
-    if (opening === 0 && received === 0 && spent === 0) continue;
 
     const closing = opening + received - spent;
     result.users.push({
@@ -565,7 +658,12 @@ export async function computeCashPosition(params: {
     result.closing += closing;
   }
 
-  result.users.sort((a, b) => b.closing - a.closing || a.name.localeCompare(b.name));
+  result.users.sort((a, b) => {
+    const aActive = a.opening !== 0 || a.received !== 0 || a.spent !== 0 || a.closing !== 0;
+    const bActive = b.opening !== 0 || b.received !== 0 || b.spent !== 0 || b.closing !== 0;
+    if (aActive !== bActive) return aActive ? -1 : 1;
+    return b.closing - a.closing || a.name.localeCompare(b.name);
+  });
   result.opening = round2(result.opening);
   result.received = round2(result.received);
   result.spent = round2(result.spent);

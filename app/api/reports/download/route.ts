@@ -5,6 +5,7 @@ import * as XLSX from "xlsx";
 import PDFDocument from "pdfkit";
 import { stringify } from "csv-stringify/sync";
 import mongoose from "mongoose";
+import { DateTime } from "luxon";
 
 import DB from "@app/_database/db";
 import Users from "@app/_model/user.model";
@@ -96,62 +97,92 @@ function toObjectIds(ids: string[]): mongoose.Types.ObjectId[] {
     .map(id => new mongoose.Types.ObjectId(id));
 }
 
-/**
- * BUG FIX #1 — Build a Date range filter for fields stored as JS Date (timestamps).
- * Used for: transactionDetails.createdAt
- */
-function makeDateFilter(fromDate?: string, toDate?: string): { $gte?: Date; $lte?: Date } {
-  const filter: { $gte?: Date; $lte?: Date } = {};
-  if (fromDate) {
-    const d = new Date(fromDate);
-    d.setHours(0, 0, 0, 0);
-    filter.$gte = d;
-  }
-  if (toDate) {
-    const d = new Date(toDate);
-    d.setHours(23, 59, 59, 999);
-    filter.$lte = d;
-  }
-  return filter;
-}
+const IST = "Asia/Kolkata";
 
 /**
- * BUG FIX #2 — Build a string range filter for fields stored as String (e.g. TravelExpense.date = "2025-04-01").
- * ISO strings are lexicographically sortable so $gte/$lte work correctly.
- * Used for: TravelExpense.date, OfficeExpense.date, ToPayExpense.date
+ * Normalizes any stored date value (BSON Date, ISO String, YYYY-MM-DD, or fallback timestamp)
+ * into a consistent calendar day string "YYYY-MM-DD" in Indian Standard Time (IST).
  */
-function makeStringDateFilter(fromDate?: string, toDate?: string): { $gte?: string; $lte?: string } {
-  const filter: { $gte?: string; $lte?: string } = {};
-  if (fromDate) filter.$gte = fromDate; // "2025-04-01"
-  if (toDate)   filter.$lte = toDate;   // "2025-04-30"
-  return filter;
+function normalizeDate(val: any, fallbackDate?: any): string {
+  if (!val && fallbackDate) val = fallbackDate;
+  if (!val) return "";
+  if (val instanceof Date && !isNaN(val.getTime())) {
+    return DateTime.fromJSDate(val).setZone(IST).toISODate() || "";
+  }
+  const s = String(val).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const dt = DateTime.fromISO(s, { zone: IST });
+  if (dt.isValid) return dt.toISODate() || "";
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return DateTime.fromJSDate(d).setZone(IST).toISODate() || "";
+  }
+  return s.length >= 10 ? s.slice(0, 10) : s;
 }
 
-// All expense category keys across all expense models
+// All expense category keys across all expense models (including contractor)
 const ALL_EXPENSE_CATEGORIES = [
   "conveyance", "purchase", "food", "tea", "hotel", "labour",
-  "courier", "loading", "porter", "cartage", "rider", "dailyWages",
-  "transport", "maintenance", "other",
+  "contractor", "courier", "loading", "porter", "cartage", "rider",
+  "dailyWages", "transport", "maintenance", "other",
 ] as const;
 
 // ─── Fetch Expense Data ─────────────────────────────────────────────────────
 
 async function fetchExpenseData(
   filters: ReportFilters,
-  userObjectIds: mongoose.Types.ObjectId[]
+  targetUserIds: string[],
+  usersMap: Map<string, any>
 ): Promise<ExpenseItem[]> {
-  
-  // BUG FIX #2: Use string comparison for the `date` field (stored as String)
-  const stringDateFilter = makeStringDateFilter(filters.fromDate, filters.toDate);
+  const isUserFilterActive = targetUserIds.length > 0 && !targetUserIds.includes("all");
+  const andClauses: any[] = [];
 
-  const baseQuery: Record<string, unknown> = {
-    createdBy: { $in: userObjectIds },
-  };
-
-  // Only add date filter if at least one bound is specified
-  if (stringDateFilter.$gte || stringDateFilter.$lte) {
-    baseQuery.date = stringDateFilter;
+  // Robust user filter: matches createdBy whether stored as ObjectId, String, or embedded object
+  if (isUserFilterActive) {
+    const targetObjectIds = toObjectIds(targetUserIds);
+    const targetKeys = [...targetObjectIds, ...targetUserIds];
+    andClauses.push({
+      $or: [
+        { createdBy: { $in: targetKeys } },
+        { "createdBy._id": { $in: targetKeys } },
+      ],
+    });
   }
+
+  // Robust date filter: covers BSON Date, String "YYYY-MM-DD", ISO with time, and createdAt fallback
+  if (filters.fromDate || filters.toDate) {
+    const fromDay = filters.fromDate;
+    const toDay = filters.toDate;
+    const startJSDate = fromDay
+      ? DateTime.fromISO(fromDay, { zone: IST }).startOf("day").toJSDate()
+      : new Date(0);
+    const endJSDate = toDay
+      ? DateTime.fromISO(toDay, { zone: IST }).endOf("day").toJSDate()
+      : new Date(8640000000000000);
+
+    const dateConditions: any[] = [
+      { date: { $gte: startJSDate, $lte: endJSDate } },
+      { createdAt: { $gte: startJSDate, $lte: endJSDate } },
+    ];
+
+    if (fromDay && toDay) {
+      dateConditions.push(
+        { date: { $gte: fromDay, $lte: toDay } },
+        { date: { $gte: fromDay, $lte: `${toDay}T23:59:59.999Z` } }
+      );
+    } else if (fromDay) {
+      dateConditions.push({ date: { $gte: fromDay } });
+    } else if (toDay) {
+      dateConditions.push(
+        { date: { $lte: toDay } },
+        { date: { $lte: `${toDay}T23:59:59.999Z` } }
+      );
+    }
+
+    andClauses.push({ $or: dateConditions });
+  }
+
+  const baseQuery: Record<string, unknown> = andClauses.length > 0 ? { $and: andClauses } : {};
 
   // Determine which expense models to query
   const expenseModelMap: Record<string, typeof TravelExpense> = {
@@ -160,10 +191,10 @@ async function fetchExpenseData(
     toPay:  ToPayExpense,
   };
 
-  const modelsToQuery =
-    !filters.expenseType || filters.expenseType === "all"
-      ? ["travel", "office", "toPay"]
-      : [filters.expenseType];
+  const rawExpenseType = filters.expenseType || "all";
+  const modelsToQuery = rawExpenseType === "all"
+    ? ["travel", "office", "toPay"]
+    : rawExpenseType.split(",").map(s => s.trim()).filter(Boolean);
 
   // Which categories to look inside each document
   const categoriesToScan =
@@ -187,18 +218,31 @@ async function fetchExpenseData(
 
     let docs: any[];
     try {
-      docs = await Model
-        .find(baseQuery, projection)
-        // BUG FIX #3: Use the registered model name string, not the imported object
-        .populate({ path: "createdBy", select: "_id name phone role" })
-        .lean();
+      docs = await Model.find(baseQuery, projection).lean();
     } catch (err) {
       console.error(`[fetchExpenseData] Error querying ${modelKey}:`, err);
       continue;
     }
 
     for (const doc of docs) {
-      const createdBy = (doc.createdBy ?? {}) as { _id?: { toString(): string }; name?: string };
+      const docDate = normalizeDate(doc.date, doc.createdAt);
+
+      // Verify date range in IST
+      if (filters.fromDate && docDate && docDate < filters.fromDate) continue;
+      if (filters.toDate && docDate && docDate > filters.toDate) continue;
+
+      const rawCreator = doc.createdBy;
+      const creatorId =
+        (typeof rawCreator === "object" && rawCreator?._id ? rawCreator._id.toString() : null) ||
+        (rawCreator ? rawCreator.toString() : "");
+
+      const user = usersMap.get(creatorId);
+      const userName = user?.name || (typeof rawCreator === "object" && rawCreator?.name) || "Unknown";
+      const userId = user?._id?.toString() || creatorId;
+
+      if (isUserFilterActive && !targetUserIds.includes(userId)) {
+        continue;
+      }
 
       for (const category of categoriesToScan) {
         const items = doc[category];
@@ -215,22 +259,22 @@ async function fetchExpenseData(
             const q = filters.search.toLowerCase();
             const haystack = [
               item.siteName, item.description, item.restaurantName,
-              item.shopName, item.hotelName, item.todayWork,
+              item.shopName, item.hotelName, item.todayWork, item.remarks,
             ].filter(Boolean).join(" ").toLowerCase();
             if (!haystack.includes(q)) continue;
           }
 
           results.push({
             _id:         String(item._id ?? ""),
-            siteName:    String(item.siteName ?? ""),
+            siteName:    String(item.siteName ?? item.serviceProvider ?? ""),
             amount:      Number(item.amount ?? 0),
-            date:        String(doc.date ?? ""),
+            date:        docDate,
             category,
-            description: String(item.description ?? ""),
-            userName:    createdBy.name || "Unknown",
-            userId:      createdBy._id?.toString() || "",
+            description: String(item.description ?? item.todayWork ?? ""),
+            userName,
+            userId,
             status:      String(item.status ?? "pending"),
-            createdAt:   new Date(doc.createdAt ?? Date.now()),
+            createdAt:   new Date(item.createdAt || doc.createdAt || Date.now()),
             ledgerType:  item.ledgerType,
             tallyEntry:  item.tallyEntry,
             adminMessage: item.adminMessage,
@@ -249,52 +293,57 @@ async function fetchExpenseData(
 
 async function fetchTransactionData(
   filters: ReportFilters,
-  userObjectIds: mongoose.Types.ObjectId[],
-  type: "credit" | "debit"
+  targetUserIds: string[],
+  type: "credit" | "debit",
+  usersMap: Map<string, any>
 ): Promise<TransactionItem[]> {
-  
-  // BUG FIX #1: Use Date objects for createdAt (stored as Date in transactionDetails)
-  const dateFilter = makeDateFilter(filters.fromDate, filters.toDate);
-  const hasDateFilter = !!(dateFilter.$gte || dateFilter.$lte);
+  const isUserFilterActive = targetUserIds.length > 0 && !targetUserIds.includes("all");
 
-  const results: TransactionItem[] = [];
+  const userQuery: any = {};
+  if (isUserFilterActive) {
+    const targetObjectIds = toObjectIds(targetUserIds);
+    const targetKeys = [...targetObjectIds, ...targetUserIds];
+    userQuery._id = { $in: targetKeys };
+  }
 
   let users: any[];
   try {
     users = await Users.find(
-      { _id: { $in: userObjectIds } },
+      userQuery,
       // Project only what we need — the specific credit/debit array + identity fields
       { _id: 1, name: 1, phone: 1, [type]: 1 }
     ).lean();
   } catch (err) {
     console.error(`[fetchTransactionData] Error querying users for ${type}:`, err);
-    return results;
+    return [];
   }
+
+  const results: TransactionItem[] = [];
 
   for (const user of users) {
     const entries: any[] = user[type] || [];
+    const uId = user._id?.toString() || "";
+    const uName = user.name || usersMap.get(uId)?.name || "Unknown";
 
     for (const entry of entries) {
       const details: any[] = entry.transactionDetails || [];
 
       for (const detail of details) {
-        // Date filter on detail.createdAt (a real Date)
-        if (hasDateFilter) {
-          const createdAt = detail.createdAt ? new Date(detail.createdAt) : null;
-          if (!createdAt) continue; // skip details with no date
+        const rawDate = detail.createdAt || detail.updatedAt || detail.date;
+        const detailDate = normalizeDate(rawDate);
 
-          if (dateFilter.$gte && createdAt < dateFilter.$gte) continue;
-          if (dateFilter.$lte && createdAt > dateFilter.$lte) continue;
-        }
+        // Date filter in IST
+        if (filters.fromDate && detailDate && detailDate < filters.fromDate) continue;
+        if (filters.toDate && detailDate && detailDate > filters.toDate) continue;
 
         // Search filter
         if (filters.search) {
           const q = filters.search.toLowerCase();
-          const haystack = `${entry.name} ${entry.phone} ${detail.reason} ${detail.remarks}`.toLowerCase();
+          const haystack = `${entry.name || ""} ${entry.phone || ""} ${detail.reason || ""} ${detail.remarks || ""}`.toLowerCase();
           if (!haystack.includes(q)) continue;
         }
 
-        const createdAt = detail.createdAt ? new Date(detail.createdAt) : new Date();
+        const createdAt = rawDate ? new Date(rawDate) : new Date();
 
         results.push({
           _id:       detail._id?.toString() || new mongoose.Types.ObjectId().toString(),
@@ -303,9 +352,9 @@ async function fetchTransactionData(
           money:     Number(detail.money  ?? 0),
           reason:    detail.reason   || "",
           remarks:   detail.remarks  || "",
-          date:      createdAt.toISOString().split("T")[0],
-          userName:  user.name       || "Unknown",
-          userId:    user._id?.toString() || "",
+          date:      detailDate || normalizeDate(createdAt),
+          userName:  uName,
+          userId:    uId,
           type,
           createdAt,
         });
@@ -537,17 +586,16 @@ export async function GET(req: NextRequest) {
 
     console.log("[Report API] filters:", JSON.stringify(filters, null, 2));
 
-    // Resolve user IDs
-    let userObjectIds: mongoose.Types.ObjectId[];
+    // Pre-fetch all users for reliable userName and userId resolution
+    const allUsers = await Users.find({}, { _id: 1, name: 1, phone: 1, role: 1 }).lean();
+    const usersMap = new Map<string, any>();
+    allUsers.forEach((u: any) => {
+      usersMap.set(u._id.toString(), u);
+    });
 
-    if (filters.users?.length && !filters.users.includes("all")) {
-      userObjectIds = toObjectIds(filters.users);
-    } else {
-      const all = await Users.find({}, { _id: 1 }).lean();
-      userObjectIds = (all as any[]).map(u => u._id);
-    }
+    const targetUserIds = (filters.users || []).filter(u => u !== "all" && u.trim() !== "");
 
-    if (userObjectIds.length === 0) {
+    if (allUsers.length === 0) {
       return NextResponse.json({
         type: "SUCCESS", message: "No users found",
         data: [], summary: { grandTotal: 0, totalRecords: 0, averagePerEntry: 0, byUser: {}, byDate: {}, byCategory: {} },
@@ -556,22 +604,22 @@ export async function GET(req: NextRequest) {
       }, { status: 200 });
     }
 
-    console.log(`[Report API] querying for ${userObjectIds.length} users, type=${filters.reportType}`);
+    console.log(`[Report API] querying with userFilter=${targetUserIds.length ? targetUserIds.join(",") : "all"}, type=${filters.reportType}`);
 
     // Fetch data based on report type
     let rawData: (ExpenseItem | TransactionItem)[] = [];
 
     if (filters.reportType === "expense") {
-      rawData = await fetchExpenseData(filters, userObjectIds);
+      rawData = await fetchExpenseData(filters, targetUserIds, usersMap);
     } else if (filters.reportType === "credit") {
-      rawData = await fetchTransactionData(filters, userObjectIds, "credit");
+      rawData = await fetchTransactionData(filters, targetUserIds, "credit", usersMap);
     } else if (filters.reportType === "debit") {
-      rawData = await fetchTransactionData(filters, userObjectIds, "debit");
+      rawData = await fetchTransactionData(filters, targetUserIds, "debit", usersMap);
     } else if (filters.reportType === "combined") {
       const [expenses, credits, debits] = await Promise.all([
-        fetchExpenseData(filters, userObjectIds),
-        fetchTransactionData(filters, userObjectIds, "credit"),
-        fetchTransactionData(filters, userObjectIds, "debit"),
+        fetchExpenseData(filters, targetUserIds, usersMap),
+        fetchTransactionData(filters, targetUserIds, "credit", usersMap),
+        fetchTransactionData(filters, targetUserIds, "debit", usersMap),
       ]);
       rawData = [...expenses, ...credits, ...debits];
     }

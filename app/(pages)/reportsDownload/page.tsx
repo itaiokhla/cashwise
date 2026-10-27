@@ -46,6 +46,7 @@ const EXPENSE_CATEGORIES: { key: ExpenseCategory; label: string }[] = [
   { key: "tea", label: "Tea" },
   { key: "hotel", label: "Hotel" },
   { key: "labour", label: "Labour" },
+  { key: "contractor", label: "Contractor" },
   { key: "courier", label: "Courier" },
   { key: "loading", label: "Loading" },
   { key: "porter", label: "Porter" },
@@ -798,7 +799,7 @@ export default function ReportPage() {
   const queryFilters: ReportFilters = useMemo(() => ({
   reportType,
   expenseType: isExpenseType 
-    ? (expenseTypes.includes("all") ? "all" : (expenseTypes[0] ?? "all")) 
+    ? (expenseTypes.includes("all") ? "all" : (expenseTypes.length > 0 ? (expenseTypes.join(",") as ExpenseType) : "all")) 
     : undefined,
   fromDate: isoD(fromDate), 
   toDate: isoD(toDate),
@@ -837,7 +838,7 @@ const { data: searchedData, isLoading: searchLoading, refetch: refetchSearch } =
     } as ReportFilters, 
     { skip: !searchTerm }
   );
-  const { data: usersRaw = [], isLoading: usersLoading } = useGetReportUsersQuery(undefined, { skip: !drawerOpen });
+  const { data: usersRaw = [], isLoading: usersLoading } = useGetReportUsersQuery();
   const usersData = useMemo(() =>
     (usersRaw as any[]).map((u: any) => ({ _id: u._id, name: u.name, type: u.type })), [usersRaw]);
 

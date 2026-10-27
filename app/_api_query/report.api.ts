@@ -19,6 +19,7 @@ export type ExpenseCategory =
   | "tea"
   | "hotel"
   | "labour"
+  | "contractor"
   | "courier"
   | "loading"
   | "porter"
@@ -225,30 +226,6 @@ export const reportApi = createApi({
         ...response,
         type: response.type as "SUCCESS" | "ERROR",
       }),
-      serializeQueryArgs: ({ queryArgs }): string => {
-        // Create stable cache key based on filters (exclude pagination for cache key)
-        const { page, limit, ...stableFilters } = queryArgs;
-        return buildReportQuery(stableFilters as Partial<ReportFilters>);
-      },
-      // Merge paginated results into a single cached list.
-      merge: (currentCache: ReportResponse, newItems: ReportResponse): void => {
-        if (newItems.pagination.page === 1) {
-          currentCache.type = newItems.type;
-          currentCache.message = newItems.message;
-          currentCache.data = [...newItems.data];
-          currentCache.summary = newItems.summary;
-          currentCache.pagination = newItems.pagination;
-          currentCache.filters = newItems.filters;
-          return;
-        }
-
-        currentCache.type = newItems.type;
-        currentCache.message = newItems.message;
-        currentCache.data.push(...newItems.data);
-        currentCache.summary = newItems.summary;
-        currentCache.pagination = newItems.pagination;
-        currentCache.filters = newItems.filters;
-      },
     }),
 
     // ─── QUERY: Prefetch Report Summary (lightweight) ────────────────────────

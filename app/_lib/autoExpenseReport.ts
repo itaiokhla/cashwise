@@ -303,7 +303,7 @@ export async function buildReportSections(job: ReportJob, slotAt: Date) {
   });
 
   const rows = result.allRows.map((r) => toReportRow(r as unknown as Record<string, unknown>));
-  const wantsCash = engineType !== "expense";
+  const wantsCash = true;
 
   const sections: ReportSection[] = [];
   for (const w of windows) {

@@ -18,7 +18,10 @@ import {
   FiAlertTriangle,
   FiCheck,
   FiCheckCircle,
+  FiChevronDown,
+  FiChevronUp,
   FiClock,
+  FiUser,
   FiCopy,
   FiDownload,
   FiExternalLink,
@@ -197,7 +200,7 @@ export default function SharedReportPage() {
   const filtered = useMemo(() => (section ? filterRows(section.rows, filters) : []), [section, filters]);
   const digest = useMemo(() => summarizeRows(filtered), [filtered]);
   const filtersActive = hasActiveFilters(filters);
-  const cashPosition: CashPosition | null | undefined = filtersActive ? null : section?.cashPosition;
+  const cashPosition: CashPosition | null | undefined = section?.cashPosition;
 
   const sorted = useMemo(() => {
     const list = [...filtered];
@@ -657,69 +660,189 @@ function StatusBar({ digest }: { digest: ReturnType<typeof summarizeRows> }) {
 }
 
 function CashCard({ digest, cashPosition, filtersActive }: { digest: ReturnType<typeof summarizeRows>; cashPosition: CashPosition | null; filtersActive: boolean }) {
-  const [showUsers, setShowUsers] = useState(false);
+  const [showUsers, setShowUsers] = useState(true);
+  const [userSearch, setUserSearch] = useState("");
+
   const steps = cashPosition
     ? [
         { label: "Opening balance", value: cashPosition.opening, sign: "" },
         { label: "Cash received", value: cashPosition.received, sign: "+" },
         { label: "Cash spent", value: cashPosition.spent, sign: "−" },
-        { label: "Cash in hand", value: cashPosition.closing, sign: "=" },
+        { label: "Remaining balance (in hand)", value: cashPosition.closing, sign: "=" },
       ]
     : [
         { label: "Cash received", value: digest.cash.received.total, sign: "+" },
         { label: "Cash spent", value: digest.cash.spent.total, sign: "−" },
         { label: "Net cash flow", value: digest.cash.net, sign: "=" },
       ];
+
+  const filteredUsers = useMemo(() => {
+    if (!cashPosition?.users) return [];
+    if (!userSearch.trim()) return cashPosition.users;
+    const q = userSearch.toLowerCase().trim();
+    return cashPosition.users.filter((u) => u.name.toLowerCase().includes(q));
+  }, [cashPosition, userSearch]);
+
   return (
     <section className="rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:p-5">
-      <div className="flex items-start justify-between gap-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 className="text-base font-bold">Cash statement</h2>
+          <h2 className="text-base font-bold text-slate-900">Remaining Balance & Cash Statement</h2>
           <p className="text-xs text-slate-500">
-            Credits received and debits booked in this period{filtersActive ? " (filtered — opening/closing balance hidden)" : ""}
+            {cashPosition
+              ? "Cash in hand, opening balances, cash received, and expenses by employee for this period."
+              : `Credits received and debits booked in this period${filtersActive ? " (filtered transactions)" : ""}`}
           </p>
         </div>
         {cashPosition && cashPosition.users.length > 0 && (
-          <button onClick={() => setShowUsers((s) => !s)} className="shrink-0 text-xs font-semibold text-indigo-600">
-            {showUsers ? "Hide" : "By employee"}
+          <button
+            onClick={() => setShowUsers((s) => !s)}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 hover:bg-slate-100"
+          >
+            <FiUser className="h-3.5 w-3.5" />
+            <span>{showUsers ? "Hide User Balances" : `Show All Users (${cashPosition.users.length})`}</span>
+            {showUsers ? <FiChevronUp className="h-3.5 w-3.5" /> : <FiChevronDown className="h-3.5 w-3.5" />}
           </button>
         )}
       </div>
-      <div className={`mt-3 grid gap-2 ${steps.length === 4 ? "grid-cols-2 lg:grid-cols-4" : "grid-cols-3"}`}>
+
+      <div className={`mt-4 grid gap-2.5 ${steps.length === 4 ? "grid-cols-2 lg:grid-cols-4" : "grid-cols-3"}`}>
         {steps.map((s, i) => (
-          <div key={s.label} className={`rounded-xl p-3 ${i === steps.length - 1 ? "bg-indigo-50 ring-1 ring-indigo-100" : "bg-slate-50"}`}>
+          <div
+            key={s.label}
+            className={`rounded-xl p-3.5 ${
+              i === steps.length - 1
+                ? s.value < 0
+                  ? "bg-red-50 ring-1 ring-red-200"
+                  : "bg-emerald-50 ring-1 ring-emerald-200"
+                : "bg-slate-50 ring-1 ring-slate-100"
+            }`}
+          >
             <div className="text-[11px] font-semibold text-slate-500">
-              {s.sign && <span className="mr-1 text-slate-400">{s.sign}</span>}
+              {s.sign && <span className="mr-1 font-bold text-slate-400">{s.sign}</span>}
               {s.label}
             </div>
-            <div className={`mt-0.5 text-base font-bold sm:text-lg ${s.value < 0 ? "text-red-700" : "text-slate-900"}`}>{fmtINR(s.value)}</div>
+            <div
+              className={`mt-1 text-lg font-extrabold sm:text-xl tabular-nums ${
+                i === steps.length - 1
+                  ? s.value < 0
+                    ? "text-red-700"
+                    : "text-emerald-800"
+                  : s.value < 0
+                  ? "text-red-700"
+                  : "text-slate-900"
+              }`}
+            >
+              {fmtINR(s.value)}
+            </div>
           </div>
         ))}
       </div>
-      {showUsers && cashPosition && (
-        <div className="-mx-4 mt-3 overflow-x-auto sm:mx-0">
-          <table className="w-full min-w-[520px] text-sm">
-            <thead>
-              <tr className="border-b border-slate-100 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                <th className="px-4 py-2">Employee</th>
-                <th className="px-4 py-2 text-right">Opening</th>
-                <th className="px-4 py-2 text-right">Received</th>
-                <th className="px-4 py-2 text-right">Spent</th>
-                <th className="px-4 py-2 text-right">In hand</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 tabular-nums">
-              {cashPosition.users.map((u) => (
-                <tr key={u.userId}>
-                  <td className="px-4 py-2 font-medium">{u.name}</td>
-                  <td className="px-4 py-2 text-right">{fmtINR(u.opening)}</td>
-                  <td className="px-4 py-2 text-right">{fmtINR(u.received)}</td>
-                  <td className="px-4 py-2 text-right">{fmtINR(u.spent)}</td>
-                  <td className={`px-4 py-2 text-right font-semibold ${u.closing < 0 ? "text-red-700" : ""}`}>{fmtINR(u.closing)}</td>
+
+      {showUsers && cashPosition && cashPosition.users.length > 0 && (
+        <div className="mt-5 border-t border-slate-100 pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <div>
+              <h3 className="text-sm font-bold text-slate-800">Remaining Balance by User</h3>
+              <p className="text-xs text-slate-500">
+                Individual cash ledger positions ({filteredUsers.length} of {cashPosition.users.length} users)
+              </p>
+            </div>
+            {cashPosition.users.length > 5 && (
+              <div className="relative w-full sm:w-64">
+                <FiSearch className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={userSearch}
+                  onChange={(e) => setUserSearch(e.target.value)}
+                  placeholder="Filter users by name…"
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 py-1.5 pl-8 pr-3 text-xs outline-none focus:border-indigo-400 focus:bg-white focus:ring-1 focus:ring-indigo-200"
+                />
+              </div>
+            )}
+          </div>
+
+          <div className="-mx-4 overflow-x-auto sm:mx-0 rounded-xl border border-slate-200">
+            <table className="w-full min-w-[580px] text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50/80 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-600">
+                  <th className="px-4 py-2.5">Employee / User</th>
+                  <th className="px-4 py-2.5 text-right">Opening Balance</th>
+                  <th className="px-4 py-2.5 text-right">Cash Received (+)</th>
+                  <th className="px-4 py-2.5 text-right">Cash Spent (−)</th>
+                  <th className="px-4 py-2.5 text-right">Remaining Balance (=)</th>
+                  <th className="px-4 py-2.5 text-center">Status</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-slate-100 tabular-nums">
+                {filteredUsers.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-6 text-center text-xs text-slate-400">
+                      No users match “{userSearch}”
+                    </td>
+                  </tr>
+                ) : (
+                  filteredUsers.map((u) => {
+                    const isPositive = u.closing > 0;
+                    const isNegative = u.closing < 0;
+                    return (
+                      <tr key={u.userId} className="hover:bg-slate-50/70 transition-colors">
+                        <td className="px-4 py-2.5 font-medium text-slate-900 flex items-center gap-2">
+                          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-slate-100 text-[10px] font-bold text-slate-600">
+                            {u.name ? u.name.slice(0, 1).toUpperCase() : "U"}
+                          </span>
+                          <span className="truncate">{u.name}</span>
+                        </td>
+                        <td className="px-4 py-2.5 text-right text-slate-600">{fmtINR(u.opening)}</td>
+                        <td className="px-4 py-2.5 text-right font-medium text-sky-700">+{fmtINR(u.received)}</td>
+                        <td className="px-4 py-2.5 text-right font-medium text-slate-700">−{fmtINR(u.spent)}</td>
+                        <td
+                          className={`px-4 py-2.5 text-right font-bold ${
+                            isNegative ? "text-red-700" : isPositive ? "text-emerald-700" : "text-slate-700"
+                          }`}
+                        >
+                          {fmtINR(u.closing)}
+                        </td>
+                        <td className="px-4 py-2.5 text-center">
+                          {isPositive ? (
+                            <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-800 ring-1 ring-emerald-200">
+                              In Hand
+                            </span>
+                          ) : isNegative ? (
+                            <span className="inline-flex items-center rounded-full bg-red-50 px-2 py-0.5 text-[10px] font-semibold text-red-800 ring-1 ring-red-200">
+                              Deficit
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                              Settled
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+              <tfoot className="border-t-2 border-slate-200 bg-slate-50/90 font-semibold tabular-nums text-slate-900">
+                <tr>
+                  <td className="px-4 py-2.5 text-xs uppercase tracking-wide text-slate-600">Total</td>
+                  <td className="px-4 py-2.5 text-right text-slate-700">{fmtINR(cashPosition.opening)}</td>
+                  <td className="px-4 py-2.5 text-right text-sky-700">+{fmtINR(cashPosition.received)}</td>
+                  <td className="px-4 py-2.5 text-right text-slate-700">−{fmtINR(cashPosition.spent)}</td>
+                  <td
+                    className={`px-4 py-2.5 text-right text-base font-extrabold ${
+                      cashPosition.closing < 0 ? "text-red-700" : "text-emerald-800"
+                    }`}
+                  >
+                    {fmtINR(cashPosition.closing)}
+                  </td>
+                  <td className="px-4 py-2.5 text-center text-xs text-slate-500">
+                    {cashPosition.users.length} user{cashPosition.users.length === 1 ? "" : "s"}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
         </div>
       )}
     </section>
